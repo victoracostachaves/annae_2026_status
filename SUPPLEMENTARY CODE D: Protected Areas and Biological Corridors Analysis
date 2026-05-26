@@ -1,0 +1,576 @@
+# =============================================================================
+# SUPPLEMENTARY CODE D: Protected Areas and Biological Corridors Analysis
+# =============================================================================
+# Original authors: Hector Zumbado and Victor Acosta
+# Improved and standardized with assistance from DeepSeek (AI assistant)
+# Date: 2026-05-25
+#
+# This script analyses the distribution of Agalychnis annae occurrences
+# relative to Costa Rica's protected areas and biological corridors.
+# It includes the newly designated Cubujuquí Biological Corridor (2024).
+#
+# Analysis steps:
+# 1. Load and prepare spatial data (mainland Costa Rica only)
+# 2. Identify occurrences inside protected areas and corridors
+# 3. Generate summary tables (CSV)
+# 4. Create multiple map variants for publication:
+#    - Labeled map (with ggrepel labels)
+#    - Clean map (opacity differentiation, no labels)
+#    - Numbered map (polygons numbered, separate legend table)
+#    - Pattern map (hatching for corridors)
+#
+# All outputs are saved to 'output/protected_areas_mainland/'
+# Subdirectories: tables/, maps/
+#
+# Required input files (relative paths):
+#   shapefiles/costa_rica_wgs84.gpkg
+#   shapefiles/land_cover/area_silvestre_protegida.gpkg
+#   shapefiles/land_cover/corredores_biologicos.gpkg
+#   shapefiles/administrative/Corredor_Cubujuqui.shp
+#   data/processed/Agalychnis_annae_full_dataset.rds
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# 0. SETUP
+# -----------------------------------------------------------------------------
+
+rm(list = ls())
+
+# Required packages
+required_packages <- c(
+  "sf", "ggplot2", "dplyr", "ggspatial", "readr", "tidyr",
+  "ggrepel", "ggpattern", "patchwork", "grid", "gridExtra"
+)
+
+installed <- rownames(installed.packages())
+for (pkg in required_packages) {
+  if (!pkg %in% installed) {
+    install.packages(pkg, dependencies = TRUE)
+  }
+  library(pkg, character.only = TRUE)
+}
+
+# Create output directories
+output_dir <- "output/protected_areas_mainland"
+tables_dir <- file.path(output_dir, "tables")
+maps_dir   <- file.path(output_dir, "maps")
+
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(tables_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(maps_dir,   recursive = TRUE, showWarnings = FALSE)
+
+cat("\n=== OUTPUT DIRECTORY CREATED ===\n")
+cat("  ", output_dir, "\n")
+cat("  (Mainland Costa Rica only - marine areas excluded)\n")
+
+# -----------------------------------------------------------------------------
+# 1. LOAD DATA
+# -----------------------------------------------------------------------------
+
+cat("\n=== LOADING DATA ===\n")
+
+# Costa Rica boundary
+costa_rica <- st_read("shapefiles/costa_rica_wgs84.gpkg", quiet = TRUE)
+
+# Define mainland bounding box (excludes Cocos Island)
+mainland_bbox <- c(xmin = -86.0, xmax = -82.5, ymin = 8.0, ymax = 11.2)
+mainland_bbox_sf <- st_as_sfc(st_bbox(mainland_bbox, crs = 4326))
+
+# Occurrence data
+annae_occs <- read_rds("data/processed/Agalychnis_annae_full_dataset.rds") %>%
+  filter(id != "Panama")
+
+# Protected areas
+protected_areas <- st_read("shapefiles/land_cover/area_silvestre_protegida.gpkg",
+                          quiet = TRUE)
+
+# Original biological corridors
+corridors <- st_read("shapefiles/land_cover/corredores_biologicos.gpkg",
+                    quiet = TRUE)
+
+# Cubujuquí Biological Corridor (2024)
+cubujiqui_path <- "shapefiles/administrative/Corredor_Cubujuqui.shp"
+if (file.exists(cubujiqui_path)) {
+  cubujiqui <- st_read(cubujiqui_path, quiet = TRUE, promote_to_multi = TRUE)
+  # Fix corrupted CRS (assign CRTM05, EPSG:5367)
+  st_crs(cubujiqui) <- NA
+  st_crs(cubujiqui) <- 5367
+  cat("  Cubujuquí corridor loaded.\n")
+} else {
+  warning("Cubujuquí shapefile not found. Proceeding without it.")
+  cubujiqui <- NULL
+}
+
+# -----------------------------------------------------------------------------
+# 2. TRANSFORM TO COMMON CRS AND FILTER TO MAINLAND
+# -----------------------------------------------------------------------------
+
+target_crs <- 5367   # CRTM05 (Costa Rica)
+
+costa_rica <- st_transform(costa_rica, target_crs)
+protected_areas <- st_transform(protected_areas, target_crs)
+corridors <- st_transform(corridors, target_crs)
+mainland_bbox_proj <- st_transform(mainland_bbox_sf, target_crs)
+
+# Filter to mainland
+costa_rica_mainland <- costa_rica[
+  st_intersects(costa_rica, mainland_bbox_proj, sparse = FALSE)[, 1], ]
+protected_areas_mainland <- protected_areas[
+  st_intersects(protected_areas, mainland_bbox_proj, sparse = FALSE)[, 1], ]
+corridors_mainland <- corridors[
+  st_intersects(corridors, mainland_bbox_proj, sparse = FALSE)[, 1], ]
+
+# Add Cubujuquí if available
+if (exists("cubujiqui") && !is.null(cubujiqui)) {
+  st_crs(cubujiqui) <- target_crs   # already assigned, but ensure
+  # Standardize column names
+  cubujiqui <- cubujiqui %>%
+    mutate(nombre_cb = as.character(nombre),
+           area_km2 = as.numeric(st_area(.) / 1e6)) %>%
+    select(nombre_cb, area_km2)
+  corridors_mainland <- rbind(
+    corridors_mainland %>% select(nombre_cb, area_km2),
+    cubujiqui
+  )
+}
+
+cat("  Filtered to mainland Costa Rica\n")
+
+# Convert occurrences to sf and filter
+annae_sf <- st_as_sf(annae_occs, coords = c("x", "y"), crs = 4326) %>%
+  st_transform(target_crs)
+
+annae_sf <- annae_sf[
+  st_intersects(annae_sf, mainland_bbox_proj, sparse = FALSE)[, 1], ] %>%
+  mutate(
+    period = case_when(
+      year < 2000 ~ "Pre-2000",
+      year >= 2000 ~ "Post-2000",
+      TRUE ~ "Unknown"
+    ),
+    id = row_number()
+  )
+
+cat("  Points within mainland:", nrow(annae_sf), "\n")
+
+# -----------------------------------------------------------------------------
+# 3. IDENTIFY POINTS IN PROTECTED AREAS
+# -----------------------------------------------------------------------------
+
+cat("\n=== IDENTIFYING POINTS IN PROTECTED AREAS ===\n")
+
+points_in_pa <- st_join(
+  annae_sf,
+  protected_areas_mainland %>% select(nombre_asp, area_km2),
+  join = st_intersects,
+  left = TRUE
+)
+
+pa_summary <- points_in_pa %>%
+  st_drop_geometry() %>%
+  filter(!is.na(nombre_asp)) %>%
+  group_by(nombre_asp, period) %>%
+  summarise(n_points = n(), area_km2 = first(area_km2), .groups = "drop") %>%
+  pivot_wider(names_from = period, values_from = n_points, values_fill = 0) %>%
+  mutate(
+    Total = `Pre-2000` + `Post-2000`,
+    points_per_km2 = round(Total / area_km2, 3)
+  ) %>%
+  arrange(desc(Total))
+
+print(head(pa_summary, 10))
+
+# -----------------------------------------------------------------------------
+# 4. IDENTIFY POINTS IN BIOLOGICAL CORRIDORS
+# -----------------------------------------------------------------------------
+
+cat("\n=== IDENTIFYING POINTS IN BIOLOGICAL CORRIDORS ===\n")
+
+points_in_corridors <- st_join(
+  annae_sf,
+  corridors_mainland %>% select(nombre_cb, area_km2),
+  join = st_intersects,
+  left = TRUE
+)
+
+corridor_summary <- points_in_corridors %>%
+  st_drop_geometry() %>%
+  filter(!is.na(nombre_cb)) %>%
+  group_by(nombre_cb, period) %>%
+  summarise(n_points = n(), area_km2 = first(area_km2), .groups = "drop") %>%
+  pivot_wider(names_from = period, values_from = n_points, values_fill = 0) %>%
+  mutate(
+    Total = `Pre-2000` + `Post-2000`,
+    points_per_km2 = round(Total / area_km2, 3)
+  ) %>%
+  arrange(desc(Total))
+
+print(corridor_summary)
+
+# -----------------------------------------------------------------------------
+# 5. POINTS IN BOTH CATEGORIES
+# -----------------------------------------------------------------------------
+
+pa_points <- points_in_pa %>%
+  filter(!is.na(nombre_asp)) %>%
+  select(id, nombre_asp) %>%
+  st_drop_geometry()
+
+corridor_points <- points_in_corridors %>%
+  filter(!is.na(nombre_cb)) %>%
+  select(id, nombre_cb) %>%
+  st_drop_geometry()
+
+both <- inner_join(pa_points, corridor_points, by = "id")
+cat("\nPoints in both categories:", nrow(both), "\n")
+
+# -----------------------------------------------------------------------------
+# 6. OVERALL STATISTICS
+# -----------------------------------------------------------------------------
+
+total_points <- nrow(annae_sf)
+points_in_pa_count <- nrow(pa_points)
+points_in_corridors_count <- nrow(corridor_points)
+points_in_both_count <- nrow(both)
+
+pre_points <- annae_sf %>% filter(period == "Pre-2000")
+post_points <- annae_sf %>% filter(period == "Post-2000")
+
+pre_in_pa <- pa_points %>% filter(id %in% pre_points$id) %>% nrow()
+pre_in_corridors <- corridor_points %>% filter(id %in% pre_points$id) %>% nrow()
+post_in_pa <- pa_points %>% filter(id %in% post_points$id) %>% nrow()
+post_in_corridors <- corridor_points %>% filter(id %in% post_points$id) %>% nrow()
+
+stats_summary <- data.frame(
+  Period = c("Total", "Pre-2000", "Post-2000"),
+  Total_Points = c(total_points, nrow(pre_points), nrow(post_points)),
+  In_Protected_Areas = c(points_in_pa_count, pre_in_pa, post_in_pa),
+  Pct_Protected = round(100 * c(points_in_pa_count, pre_in_pa, post_in_pa) /
+                          c(total_points, nrow(pre_points), nrow(post_points)), 1),
+  In_Corridors = c(points_in_corridors_count, pre_in_corridors, post_in_corridors),
+  Pct_Corridors = round(100 * c(points_in_corridors_count, pre_in_corridors, post_in_corridors) /
+                          c(total_points, nrow(pre_points), nrow(post_points)), 1),
+  In_Both = c(points_in_both_count, NA, NA),
+  Pct_Both = c(round(100 * points_in_both_count / total_points, 1), NA, NA)
+)
+
+print(stats_summary)
+
+# -----------------------------------------------------------------------------
+# 7. SAVE TABLES
+# -----------------------------------------------------------------------------
+
+write.csv(pa_summary, file.path(tables_dir, "protected_areas_points.csv"),
+          row.names = FALSE)
+write.csv(corridor_summary, file.path(tables_dir, "corridors_points.csv"),
+          row.names = FALSE)
+write.csv(stats_summary, file.path(tables_dir, "overall_stats.csv"),
+          row.names = FALSE)
+
+cat("\n✅ Tables saved\n")
+
+# -----------------------------------------------------------------------------
+# 8. PREPARE COMMON PLOTTING ELEMENTS
+# -----------------------------------------------------------------------------
+
+pre_color       <- "#3366CC"   # Blue
+post_color      <- "#FF9933"   # Orange
+protected_color <- "#2E8B57"   # Forest green
+corridor_color  <- "#8B4513"   # Brown
+
+# Base map theme
+map_theme <- theme_minimal() +
+  theme(
+    axis.text = element_blank(),
+    axis.title = element_blank(),
+    panel.grid = element_blank(),
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+    plot.subtitle = element_text(hjust = 0.5, size = 11, color = "gray40"),
+    legend.position = "right",
+    legend.title = element_text(face = "bold", size = 10),
+    legend.text = element_text(size = 9),
+    legend.box = "vertical",
+    legend.margin = margin(10, 10, 10, 10)
+  )
+
+# Areas with occurrences (for maps)
+pa_with_occs <- protected_areas_mainland %>%
+  filter(nombre_asp %in% pa_summary$nombre_asp)
+
+corr_with_occs <- corridors_mainland %>%
+  filter(nombre_cb %in% corridor_summary$nombre_cb)
+
+# -----------------------------------------------------------------------------
+# 9. MAP 1: STANDARD LABELED MAP (with ggrepel)
+# -----------------------------------------------------------------------------
+
+cat("\n=== MAP 1: STANDARD WITH LABELS ===\n")
+
+pa_centroids <- pa_with_occs %>%
+  st_centroid() %>%
+  mutate(x = st_coordinates(.)[, 1],
+         y = st_coordinates(.)[, 2],
+         label = nombre_asp)
+
+corr_centroids <- corr_with_occs %>%
+  st_centroid() %>%
+  mutate(x = st_coordinates(.)[, 1],
+         y = st_coordinates(.)[, 2],
+         label = nombre_cb)
+
+p_labeled <- ggplot() +
+  geom_sf(data = costa_rica_mainland, fill = "gray95", color = "gray40", linewidth = 0.5) +
+  geom_sf(data = protected_areas_mainland, aes(fill = "Protected Areas"),
+          alpha = 0.2, color = protected_color, linewidth = 0.2) +
+  geom_sf(data = corridors_mainland, aes(fill = "Biological Corridors"),
+          alpha = 0.2, color = corridor_color, linewidth = 0.2) +
+  geom_sf(data = annae_sf %>% filter(period == "Pre-2000"),
+          aes(color = "Before 2000"), size = 1.5) +
+  geom_sf(data = annae_sf %>% filter(period == "Post-2000"),
+          aes(color = "2000-2025"), size = 1.5) +
+  scale_fill_manual(name = "Land Protection",
+                    values = c("Protected Areas" = protected_color,
+                               "Biological Corridors" = corridor_color)) +
+  scale_color_manual(name = "Observation Period",
+                     values = c("Before 2000" = pre_color,
+                                "2000-2025" = post_color)) +
+  ggrepel::geom_label_repel(data = pa_centroids,
+                            aes(x = x, y = y, label = label),
+                            size = 2.8, fill = alpha("white", 0.8),
+                            box.padding = 2.5, point.padding = 1.2,
+                            segment.color = protected_color,
+                            force = 15, max.iter = 30000,
+                            show.legend = FALSE) +
+  ggrepel::geom_label_repel(data = corr_centroids,
+                            aes(x = x, y = y, label = label),
+                            size = 2.8, fill = alpha("white", 0.8),
+                            box.padding = 2.5, point.padding = 1.2,
+                            segment.color = corridor_color,
+                            force = 15, max.iter = 30000,
+                            show.legend = FALSE) +
+  annotation_scale(location = "bl", width_hint = 0.2) +
+  annotation_north_arrow(location = "tr", which_north = "true") +
+  labs(title = "Agalychnis annae - Protected Areas & Corridors",
+       subtitle = "Labels may overlap in dense regions") +
+  map_theme
+
+ggsave(file.path(maps_dir, "map_labeled.png"), p_labeled,
+       width = 12, height = 10, dpi = 300)
+ggsave(file.path(maps_dir, "map_labeled.pdf"), p_labeled,
+       width = 12, height = 10)
+
+# -----------------------------------------------------------------------------
+# 10. MAP 2: CLEAN OPACITY-DIFFERENTIATED (NO LABELS)
+# -----------------------------------------------------------------------------
+
+cat("\n=== MAP 2: CLEAN WITH OPACITY DIFFERENTIATION ===\n")
+
+p_clean <- ggplot() +
+  geom_sf(data = costa_rica_mainland, fill = "gray98", color = "gray40", linewidth = 0.4) +
+  geom_sf(data = protected_areas_mainland, fill = NA, color = "gray70",
+          linewidth = 0.2, linetype = "dotted") +
+  geom_sf(data = corridors_mainland, fill = NA, color = "gray70",
+          linewidth = 0.2, linetype = "dotted") +
+  geom_sf(data = pa_with_occs, aes(fill = "Protected Areas with occurrences"),
+          color = protected_color, linewidth = 0.3, alpha = 0.7) +
+  geom_sf(data = corr_with_occs, aes(fill = "Biological Corridors with occurrences"),
+          color = corridor_color, linewidth = 0.3, alpha = 0.4) +
+  geom_sf(data = annae_sf %>% filter(period == "Pre-2000"),
+          aes(color = "Before 2000"), size = 1.5) +
+  geom_sf(data = annae_sf %>% filter(period == "Post-2000"),
+          aes(color = "2000-2025"), size = 1.5) +
+  scale_fill_manual(name = "Areas with occurrences",
+                    values = c("Protected Areas with occurrences" = protected_color,
+                               "Biological Corridors with occurrences" = corridor_color)) +
+  scale_color_manual(name = "Observation Period",
+                     values = c("Before 2000" = pre_color,
+                                "2000-2025" = post_color)) +
+  annotation_scale(location = "bl", width_hint = 0.2) +
+  annotation_north_arrow(location = "tr", which_north = "true") +
+  labs(title = "Agalychnis annae - Protected Areas & Corridors",
+       subtitle = "Protected areas (darker) and corridors (lighter) with occurrences") +
+  map_theme
+
+ggsave(file.path(maps_dir, "map_clean_opacity.png"), p_clean,
+       width = 12, height = 10, dpi = 300)
+ggsave(file.path(maps_dir, "map_clean_opacity.pdf"), p_clean,
+       width = 12, height = 10)
+
+# -----------------------------------------------------------------------------
+# 11. MAP 3: NUMBERED POLYGONS + LEGEND TABLE
+# -----------------------------------------------------------------------------
+
+cat("\n=== MAP 3: NUMBERED AREAS WITH LEGEND TABLE ===\n")
+
+pa_numbered <- pa_with_occs %>%
+  arrange(nombre_asp) %>%
+  mutate(map_id = paste0("P", row_number()))
+
+corr_numbered <- corr_with_occs %>%
+  arrange(nombre_cb) %>%
+  mutate(map_id = paste0("C", row_number()))
+
+pa_labels_num <- pa_numbered %>%
+  st_centroid() %>%
+  mutate(x = st_coordinates(.)[, 1],
+         y = st_coordinates(.)[, 2])
+
+corr_labels_num <- corr_numbered %>%
+  st_centroid() %>%
+  mutate(x = st_coordinates(.)[, 1],
+         y = st_coordinates(.)[, 2])
+
+legend_table <- bind_rows(
+  pa_numbered %>% st_drop_geometry() %>%
+    select(ID = map_id, Name = nombre_asp, Type = "Protected Area"),
+  corr_numbered %>% st_drop_geometry() %>%
+    select(ID = map_id, Name = nombre_cb, Type = "Biological Corridor")
+) %>% arrange(Type, ID)
+
+write.csv(legend_table, file.path(tables_dir, "map_numbered_legend.csv"),
+          row.names = FALSE)
+
+p_numbered <- ggplot() +
+  geom_sf(data = costa_rica_mainland, fill = "gray98", color = "gray40", linewidth = 0.4) +
+  geom_sf(data = protected_areas_mainland, fill = NA, color = "gray70",
+          linewidth = 0.2, linetype = "dotted") +
+  geom_sf(data = corridors_mainland, fill = NA, color = "gray70",
+          linewidth = 0.2, linetype = "dotted") +
+  geom_sf(data = pa_numbered, aes(fill = "Protected Areas"),
+          color = protected_color, linewidth = 0.3, alpha = 0.7) +
+  geom_sf(data = corr_numbered, aes(fill = "Biological Corridors"),
+          color = corridor_color, linewidth = 0.3, alpha = 0.4) +
+  geom_sf(data = annae_sf %>% filter(period == "Pre-2000"),
+          aes(color = "Before 2000"), size = 1.5) +
+  geom_sf(data = annae_sf %>% filter(period == "Post-2000"),
+          aes(color = "2000-2025"), size = 1.5) +
+  geom_text(data = pa_labels_num, aes(x = x, y = y, label = map_id),
+            size = 3, fontface = "bold", color = "white") +
+  geom_text(data = corr_labels_num, aes(x = x, y = y, label = map_id),
+            size = 3, fontface = "bold", color = "white") +
+  scale_fill_manual(name = "Areas with occurrences",
+                    values = c("Protected Areas" = protected_color,
+                               "Biological Corridors" = corridor_color)) +
+  scale_color_manual(name = "Observation Period",
+                     values = c("Before 2000" = pre_color,
+                                "2000-2025" = post_color)) +
+  annotation_scale(location = "bl", width_hint = 0.2) +
+  annotation_north_arrow(location = "tr", which_north = "true") +
+  labs(title = "Agalychnis annae - Protected Areas & Corridors",
+       subtitle = "Numbers correspond to areas in map_numbered_legend.csv") +
+  map_theme
+
+ggsave(file.path(maps_dir, "map_numbered_areas.png"), p_numbered,
+       width = 12, height = 10, dpi = 300)
+ggsave(file.path(maps_dir, "map_numbered_areas.pdf"), p_numbered,
+       width = 12, height = 10)
+
+cat("✅ Numbered map saved. Legend table: map_numbered_legend.csv\n")
+
+# -----------------------------------------------------------------------------
+# 12. MAP 4: TEXTURE/PATTERN FOR CORRIDORS
+# -----------------------------------------------------------------------------
+
+cat("\n=== MAP 4: TEXTURE FOR CORRIDORS ===\n")
+
+p_pattern <- ggplot() +
+  geom_sf(data = costa_rica_mainland, fill = "gray98", color = "gray40", linewidth = 0.4) +
+  geom_sf(data = protected_areas_mainland, fill = NA, color = "gray70",
+          linewidth = 0.2, linetype = "dotted") +
+  geom_sf(data = corridors_mainland, fill = NA, color = "gray70",
+          linewidth = 0.2, linetype = "dotted") +
+  geom_sf(data = pa_with_occs, aes(fill = "Protected Areas"),
+          color = protected_color, linewidth = 0.3, alpha = 0.7) +
+  ggpattern::geom_sf_pattern(data = corr_with_occs,
+                             aes(pattern = "Biological Corridors"),
+                             pattern = "stripe", pattern_angle = 45,
+                             pattern_spacing = 0.01,
+                             pattern_fill = corridor_color,
+                             pattern_color = NA,
+                             fill = NA, color = corridor_color,
+                             linewidth = 0.3, alpha = 0.6) +
+  geom_sf(data = annae_sf %>% filter(period == "Pre-2000"),
+          aes(color = "Before 2000"), size = 1.5) +
+  geom_sf(data = annae_sf %>% filter(period == "Post-2000"),
+          aes(color = "2000-2025"), size = 1.5) +
+  scale_fill_manual(name = "Areas with occurrences",
+                    values = c("Protected Areas" = protected_color)) +
+  ggpattern::scale_pattern_manual(name = "",
+                                  values = c("Biological Corridors" = "stripe")) +
+  scale_color_manual(name = "Observation Period",
+                     values = c("Before 2000" = pre_color,
+                                "2000-2025" = post_color)) +
+  annotation_scale(location = "bl", width_hint = 0.2) +
+  annotation_north_arrow(location = "tr", which_north = "true") +
+  labs(title = "Agalychnis annae - Protected Areas & Corridors",
+       subtitle = "Corridors shown with diagonal hatching") +
+  map_theme +
+  theme(legend.key = element_rect(fill = "white", color = NA))
+
+ggsave(file.path(maps_dir, "map_pattern_corridors.png"), p_pattern,
+       width = 12, height = 10, dpi = 300)
+ggsave(file.path(maps_dir, "map_pattern_corridors.pdf"), p_pattern,
+       width = 12, height = 10)
+
+# -----------------------------------------------------------------------------
+# 13. SUMMARY REPORT
+# -----------------------------------------------------------------------------
+
+sink(file.path(output_dir, "protected_areas_report.txt"))
+
+cat("========================================\n")
+cat("PROTECTED AREAS AND CORRIDORS ANALYSIS\n")
+cat("Agalychnis annae\n")
+cat("========================================\n\n")
+cat("DATE:", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), "\n\n")
+cat("NOTE: Analysis restricted to MAINLAND COSTA RICA only.\n")
+cat("      Includes the 2024 Cubujuquí Biological Corridor.\n\n")
+
+cat("1. OVERALL STATISTICS BY PERIOD\n")
+cat("----------------------------------------\n")
+print(stats_summary)
+cat("\n")
+
+cat("2. PROTECTED AREAS WITH OCCURRENCES\n")
+cat("----------------------------------------\n")
+print(pa_summary)
+cat("\n")
+
+cat("3. BIOLOGICAL CORRIDORS WITH OCCURRENCES\n")
+cat("----------------------------------------\n")
+print(corridor_summary)
+cat("\n")
+
+cat("4. FILES GENERATED\n")
+cat("----------------------------------------\n")
+cat("Tables:\n")
+cat("  • protected_areas_points.csv\n")
+cat("  • corridors_points.csv\n")
+cat("  • overall_stats.csv\n")
+cat("  • map_numbered_legend.csv\n")
+cat("\nMaps:\n")
+cat("  • map_labeled.png/pdf\n")
+cat("  • map_clean_opacity.png/pdf\n")
+cat("  • map_numbered_areas.png/pdf\n")
+cat("  • map_pattern_corridors.png/pdf\n")
+
+sink()
+
+cat("\n✅ Report saved:", file.path(output_dir, "protected_areas_report.txt"), "\n")
+
+# -----------------------------------------------------------------------------
+# 14. FINAL SUMMARY
+# -----------------------------------------------------------------------------
+
+cat("\n", rep("=", 70), "\n", sep = "")
+cat("✅ ANALYSIS COMPLETE\n")
+cat(rep("=", 70), "\n\n", sep = "")
+cat("Output directory:\n  ", output_dir, "\n")
+cat("Subdirectories: tables, maps\n")
+
+# Try to open output folder (Windows only)
+if (.Platform$OS.type == "windows") {
+  tryCatch(shell.exec(output_dir), error = function(e) NULL)
+}
+
+cat("\n=== END OF SCRIPT ===\n")
