@@ -1,0 +1,675 @@
+# =============================================================================
+# SUPPLEMENTARY CODE C: Environmental Maps + Population PCA for Agalychnis annae
+# =============================================================================
+# Original authors: Hector Zumbado and Victor Acosta
+# Improved and standardized with assistance from DeepSeek (AI assistant)
+# Date: 2026-05-25
+#
+# This script performs two main tasks:
+# 1. Generates publication‑quality maps of environmental variables (19 bioclimatic
+#    variables, elevation, Human Footprint Index, coffee cover) at 30 arc‑second
+#    resolution, with occurrence records coloured by time period (pre‑2000 vs post‑2000).
+# 2. Performs a PCA on environmental data extracted for three geographic populations
+#    of A. annae (Tilarán‑Monteverde, Central Plateau, Fila Costeña‑San Vito)
+#    plus background points, and produces biplots, boxplots, density plots,
+#    Wilcoxon tests, and an Excel summary.
+#
+# Required input files (relative paths):
+#   data/processed/Agalychnis_annae_full_dataset.rds  – cleaned occurrences
+#   shapefiles/costa_rica_wgs84.gpkg                  – Costa Rica boundary
+#   rasters/env_stack_annae_30s.tif                   – 22‑layer environmental stack
+#
+# Outputs (all created automatically):
+#   output/figures/maps_30s/individual/  – one map per variable (PNG + PDF)
+#   output/figures/maps_30s/variations/  – alternative backgrounds/palettes
+#   output/figures/population_pca/       – PCA biplot, boxplots, density plots,
+#                                          variable contributions, Excel results
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# 0. SETUP
+# -----------------------------------------------------------------------------
+
+rm(list = ls())
+
+# Load required packages
+library(terra)
+library(sf)
+library(ggplot2)
+library(ggspatial)
+library(dplyr)
+library(readr)
+library(cowplot)
+library(tidyr)
+library(FactoMineR)
+library(factoextra)
+library(patchwork)
+library(writexl)
+
+# Create output directories
+dir.create("output/figures/maps_30s/individual", recursive = TRUE, showWarnings = FALSE)
+dir.create("output/figures/maps_30s/variations", recursive = TRUE, showWarnings = FALSE)
+dir.create("output/figures/population_pca",      recursive = TRUE, showWarnings = FALSE)
+
+# -----------------------------------------------------------------------------
+# 1. LOAD SPATIAL DATA
+# -----------------------------------------------------------------------------
+
+cat("Loading shapefiles and occurrence data...\n")
+
+# Costa Rica boundary
+costa_rica <- st_read("shapefiles/costa_rica_wgs84.gpkg", quiet = TRUE)
+
+# Occurrence records
+occ_all <- read_rds("data/processed/Agalychnis_annae_full_dataset.rds") %>%
+  filter(id != "Panama")   # keep only Costa Rica
+
+# Split by time period for mapping
+occ_pre  <- occ_all %>% filter(year < 2000)
+occ_post <- occ_all %>% filter(year >= 2000)
+
+n_pre  <- nrow(occ_pre)
+n_post <- nrow(occ_post)
+
+cat(sprintf("Pre-2000 records: %d\n", n_pre))
+cat(sprintf("Post-2000 records: %d\n", n_post))
+
+# Convert to sf (WGS84)
+pre_sf  <- st_as_sf(occ_pre,  coords = c("x", "y"), crs = 4326)
+post_sf <- st_as_sf(occ_post, coords = c("x", "y"), crs = 4326)
+
+# -----------------------------------------------------------------------------
+# 2. LOAD ENVIRONMENTAL STACK
+# -----------------------------------------------------------------------------
+
+env_stack_file <- "rasters/env_stack_annae_30s.tif"
+if (!file.exists(env_stack_file)) {
+  stop("Environmental stack not found. Please ensure 'rasters/env_stack_annae_30s.tif' exists.")
+}
+env_stack <- rast(env_stack_file)
+cat(sprintf("Loaded %d environmental layers at 30 arc-seconds\n", nlyr(env_stack)))
+
+# Reproject all spatial objects to match the stack's CRS
+target_crs <- crs(env_stack, proj = TRUE)
+costa_rica <- st_transform(costa_rica, target_crs)
+pre_sf     <- st_transform(pre_sf, target_crs)
+post_sf    <- st_transform(post_sf, target_crs)
+
+# -----------------------------------------------------------------------------
+# 3. VARIABLE METADATA AND COLOUR PALETTES (for mapping)
+# -----------------------------------------------------------------------------
+
+# Human‑readable titles for each variable
+var_meta <- list(
+  bio_1  = list(title = "Annual Mean Temperature",              units = "°C",  pal = "temp"),
+  bio_2  = list(title = "Mean Diurnal Range",                   units = "°C",  pal = "season"),
+  bio_3  = list(title = "Isothermality",                        units = "",    pal = "season"),
+  bio_4  = list(title = "Temperature Seasonality",              units = "",    pal = "season"),
+  bio_5  = list(title = "Max Temp – Warmest Month",             units = "°C",  pal = "temp"),
+  bio_6  = list(title = "Min Temp – Coldest Month",             units = "°C",  pal = "temp"),
+  bio_7  = list(title = "Temperature Annual Range",             units = "°C",  pal = "season"),
+  bio_8  = list(title = "Mean Temp – Wettest Quarter",          units = "°C",  pal = "temp"),
+  bio_9  = list(title = "Mean Temp – Driest Quarter",           units = "°C",  pal = "temp"),
+  bio_10 = list(title = "Mean Temp – Warmest Quarter",          units = "°C",  pal = "temp"),
+  bio_11 = list(title = "Mean Temp – Coldest Quarter",          units = "°C",  pal = "temp"),
+  bio_12 = list(title = "Annual Precipitation",                 units = "mm",  pal = "precip"),
+  bio_13 = list(title = "Precip – Wettest Month",               units = "mm",  pal = "precip"),
+  bio_14 = list(title = "Precip – Driest Month",                units = "mm",  pal = "precip"),
+  bio_15 = list(title = "Precipitation Seasonality",            units = "CV",  pal = "season"),
+  bio_16 = list(title = "Precip – Wettest Quarter",             units = "mm",  pal = "precip"),
+  bio_17 = list(title = "Precip – Driest Quarter",              units = "mm",  pal = "precip"),
+  bio_18 = list(title = "Precip – Warmest Quarter",             units = "mm",  pal = "precip"),
+  bio_19 = list(title = "Precip – Coldest Quarter",             units = "mm",  pal = "precip"),
+  elevation = list(title = "Elevation",                         units = "m",   pal = "elev"),
+  hfi       = list(title = "Human Footprint Index",             units = "HFI", pal = "hfi"),
+  coffee    = list(title = "Coffee Plantations (ICAFE)",        units = "",    pal = "coffee")
+)
+
+# Colour palettes
+pals <- list(
+  temp   = c("#2c7bb6","#6baed6","#c6dbef","#ffffbf","#fdcc8a","#fc8d59","#d7191c"),
+  precip = c("#f7fbff","#deebf7","#c6dbef","#9ecae1","#6baed6","#3182bd","#08519c"),
+  season = c("#f7fbff","#deebf7","#c6dbef","#6baed6","#2171b5"),
+  elev   = c("#f7fcf0","#ccebc5","#7bccc4","#2b8cbe","#084081","#02213a"),
+  hfi    = c("#ffffd9","#c7e9b4","#7fcdbb","#41b6c4","#1d91c0","#225ea8","#081d58"),
+  coffee = NULL
+)
+coffee_fill <- "#6B3A2A"
+
+# Point symbology: yellow circles (pre-2000) and dark red triangles (post-2000)
+pre_fill    <- "#FFD700"
+post_fill   <- "#D73027"
+border_col  <- "black"
+pre_shape   <- 21
+post_shape  <- 24
+stroke_w    <- 0.5
+point_size  <- 1.0
+point_alpha <- 0.7
+
+# -----------------------------------------------------------------------------
+# 4. HELPER FUNCTIONS FOR MAPS
+# -----------------------------------------------------------------------------
+
+# Convert raster to data frame (with optional subsampling)
+rast_to_df <- function(r, vname, max_cells = 200000) {
+  df <- as.data.frame(r, xy = TRUE, na.rm = TRUE)
+  names(df)[3] <- vname
+  if (nrow(df) > max_cells) {
+    set.seed(123)
+    df <- df[sample(nrow(df), max_cells), ]
+  }
+  df
+}
+
+# Publication‑ready theme for maps
+theme_map <- function(base_size = 9, panel_fill = "white", grid_color = "grey80") {
+  theme_minimal(base_size = base_size) +
+    theme(
+      plot.background  = element_rect(fill = "white", colour = NA),
+      panel.background = element_rect(fill = panel_fill, colour = NA),
+      panel.grid.major = element_line(colour = grid_color, linewidth = 0.3),
+      panel.grid.minor = element_blank(),
+      axis.title       = element_blank(),
+      axis.text        = element_text(size = 6),
+      plot.title       = element_text(face = "bold", hjust = 0.5, size = base_size + 1),
+      plot.subtitle    = element_blank(),
+      legend.position  = "none",
+      plot.margin      = margin(2, 2, 2, 2)
+    )
+}
+
+# Build a single map (with optional legends)
+build_map <- function(var_name,
+                      land_fill = "white",
+                      panel_fill = "white",
+                      grid_color = "grey80",
+                      show_fill_legend = FALSE,
+                      show_shape_legend = FALSE) {
+  meta <- var_meta[[var_name]]
+  if (is.null(meta)) meta <- list(title = var_name, units = "", pal = "temp")
+  
+  is_coffee <- (meta$pal == "coffee")
+  df <- rast_to_df(env_stack[[var_name]], var_name)
+  
+  p <- ggplot() +
+    geom_sf(data = costa_rica, fill = land_fill, colour = "black", linewidth = 0.4)
+  
+  if (is_coffee) {
+    df_cof <- df[df[[var_name]] > 0.01, ]
+    p <- p + geom_tile(data = df_cof, aes(x = x, y = y),
+                       fill = coffee_fill, alpha = 0.75)
+  } else {
+    p <- p + geom_tile(data = df, aes(x = x, y = y, fill = .data[[var_name]]))
+  }
+  
+  # Points: pre-2000 (circles), post-2000 (triangles)
+  p <- p +
+    geom_sf(data = pre_sf,  aes(shape = "Pre-2000"),
+            fill = pre_fill, colour = border_col,
+            size = point_size, alpha = point_alpha, stroke = stroke_w) +
+    geom_sf(data = post_sf, aes(shape = "Post-2000"),
+            fill = post_fill, colour = border_col,
+            size = point_size, alpha = point_alpha, stroke = stroke_w)
+  
+  # Fill scale (continuous variables)
+  if (!is_coffee) {
+    pal_cols <- pals[[meta$pal]]
+    p <- p + scale_fill_gradientn(
+      colours = pal_cols, na.value = "transparent",
+      name = meta$units,
+      guide = if(show_fill_legend) {
+        guide_colorbar(
+          barwidth = unit(0.4, "cm"), barheight = unit(2.5, "cm"),
+          title.position = "top", title.hjust = 0.5,
+          frame.colour = "grey40", ticks.colour = "grey40"
+        )
+      } else {
+        "none"
+      }
+    )
+  }
+  
+  # Shape legend (time period)
+  p <- p + scale_shape_manual(
+    name   = "Period",
+    values = c("Pre-2000" = pre_shape, "Post-2000" = post_shape),
+    labels = c("Pre-2000", "Post-2000"),
+    guide  = if(show_shape_legend) {
+      guide_legend(
+        override.aes = list(
+          fill   = c(pre_fill, post_fill),
+          colour = border_col,
+          size   = 2,
+          stroke = stroke_w
+        )
+      )
+    } else {
+      "none"
+    }
+  )
+  
+  p + coord_sf(expand = FALSE) +
+    theme_map(panel_fill = panel_fill, grid_color = grid_color) +
+    labs(title = meta$title)
+}
+
+# -----------------------------------------------------------------------------
+# 5. GENERATE INDIVIDUAL MAPS (one per variable)
+# -----------------------------------------------------------------------------
+
+cat("\nGenerating individual maps...\n")
+var_names <- names(env_stack)
+
+for (i in seq_along(var_names)) {
+  v <- var_names[i]
+  cat(sprintf("  [%02d/%02d] %s\n", i, length(var_names), v))
+  
+  p <- tryCatch(
+    build_map(v, show_fill_legend = TRUE, show_shape_legend = TRUE) +
+      theme(
+        legend.position = "right",
+        legend.title    = element_text(face = "bold", size = 7),
+        legend.text     = element_text(size = 6),
+        legend.key.size = unit(0.4, "cm"),
+        legend.box      = "vertical",
+        legend.spacing  = unit(0.1, "cm")
+      ),
+    error = function(e) { cat("      ERROR:", e$message, "\n"); NULL }
+  )
+  
+  if (!is.null(p)) {
+    fbase <- file.path("output/figures/maps_30s/individual", sprintf("map_%s", v))
+    ggsave(paste0(fbase, ".png"), p, width = 7, height = 5.5, dpi = 300, bg = "white")
+    ggsave(paste0(fbase, ".pdf"), p, width = 7, height = 5.5, device = cairo_pdf)
+  }
+}
+cat("Individual maps saved.\n")
+
+# -----------------------------------------------------------------------------
+# 6. VARIATIONS (alternative backgrounds and HFI palettes)
+# -----------------------------------------------------------------------------
+
+cat("\nGenerating alternative background variations...\n")
+
+bg_list <- list(
+  white = list(land = "white", panel = "white", grid = "grey80"),
+  gray  = list(land = "grey90", panel = "grey95", grid = "white")
+)
+
+hfi_opts <- list(
+  YlGnBu     = pals$hfi,
+  gray_scale = c("#f7f7f7","#d9d9d9","#bdbdbd","#969696","#737373","#525252")
+)
+
+for (bg_name in names(bg_list)) {
+  bg <- bg_list[[bg_name]]
+  for (v in var_names) {
+    p <- build_map(v, land_fill = bg$land, panel_fill = bg$panel, grid_color = bg$grid,
+                   show_fill_legend = TRUE, show_shape_legend = TRUE) +
+      theme(
+        legend.position = "right",
+        legend.title    = element_text(face = "bold", size = 7),
+        legend.text     = element_text(size = 6),
+        legend.key.size = unit(0.4, "cm"),
+        legend.box      = "vertical"
+      )
+    
+    if (v == "hfi") {
+      for (pal_name in names(hfi_opts)) {
+        pal <- hfi_opts[[pal_name]]
+        p_hfi <- build_map("hfi", land_fill = bg$land, panel_fill = bg$panel, grid_color = bg$grid,
+                           show_fill_legend = TRUE, show_shape_legend = TRUE) +
+          scale_fill_gradientn(colours = pal, na.value = "transparent", name = "HFI",
+                               guide = guide_colorbar(barwidth = 0.4, barheight = 2.5,
+                                                      title.position = "top", title.hjust = 0.5)) +
+          theme(legend.position = "right",
+                legend.title = element_text(face = "bold", size = 7),
+                legend.text  = element_text(size = 6),
+                legend.key.size = unit(0.4, "cm"),
+                legend.box = "vertical")
+        
+        var_dir <- file.path("output/figures/maps_30s/variations", bg_name, paste0("hfi_", pal_name))
+        dir.create(var_dir, recursive = TRUE, showWarnings = FALSE)
+        ggsave(file.path(var_dir, "map_hfi.png"), p_hfi, width = 7, height = 5.5, dpi = 300, bg = "white")
+      }
+    } else {
+      var_dir <- file.path("output/figures/maps_30s/variations", bg_name)
+      dir.create(var_dir, recursive = TRUE, showWarnings = FALSE)
+      ggsave(file.path(var_dir, sprintf("map_%s.png", v)), p, width = 7, height = 5.5, dpi = 300, bg = "white")
+    }
+  }
+}
+cat("Variations complete.\n")
+
+# =============================================================================
+# PART II: POPULATION PCA
+# =============================================================================
+
+cat("\n\n=== STARTING POPULATION PCA ===\n")
+
+# -----------------------------------------------------------------------------
+# 7. Define populations (three geographic regions)
+# -----------------------------------------------------------------------------
+
+# Bounding boxes for each population
+mv_bbox <- c(xmin = -84.90, xmax = -84.70, ymin = 10.20, ymax = 10.40)   # Tilarán-Monteverde
+cp_bbox <- c(xmin = -84.30, xmax = -83.70, ymin = 9.70, ymax = 10.10)    # Central Plateau
+sv_bbox <- c(xmin = -83.10, xmax = -82.90, ymin = 8.75, ymax = 8.95)      # Fila Costeña-San Vito
+
+# Assign population labels to occurrences (using original x,y in WGS84)
+occ_all <- occ_all %>%
+  mutate(
+    population = case_when(
+      x >= mv_bbox["xmin"] & x <= mv_bbox["xmax"] &
+        y >= mv_bbox["ymin"] & y <= mv_bbox["ymax"] ~ "Tilarán-Monteverde",
+      x >= cp_bbox["xmin"] & x <= cp_bbox["xmax"] &
+        y >= cp_bbox["ymin"] & y <= cp_bbox["ymax"] ~ "Central Plateau",
+      x >= sv_bbox["xmin"] & x <= sv_bbox["xmax"] &
+        y >= sv_bbox["ymin"] & y <= sv_bbox["ymax"] ~ "Fila Costeña-San Vito",
+      TRUE ~ "Other"
+    )
+  )
+
+cat("\nCounts by population:\n")
+print(table(occ_all$population))
+
+# -----------------------------------------------------------------------------
+# 8. Prepare points for PCA (occurrences + background)
+# -----------------------------------------------------------------------------
+
+annae_sf <- st_as_sf(occ_all, coords = c("x", "y"), crs = 4326)
+
+set.seed(123)
+bg_points <- st_sample(costa_rica, size = 5000, type = "random")
+bg_sf <- st_sf(geometry = bg_points)
+bg_sf$population <- "Background"
+
+all_points <- rbind(
+  annae_sf %>% dplyr::select(population, geometry),
+  bg_sf   %>% dplyr::select(population, geometry)
+)
+
+cat("\nTotal points for PCA:", nrow(all_points), "\n")
+for (pop in c("Background", "Tilarán-Monteverde", "Central Plateau", "Fila Costeña-San Vito", "Other"))
+  cat("  - ", pop, ":", sum(all_points$population == pop), "\n")
+
+# -----------------------------------------------------------------------------
+# 9. Extract environmental values (all layers except coffee)
+# -----------------------------------------------------------------------------
+
+all_vars <- names(env_stack)
+pca_vars <- setdiff(all_vars, "coffee")
+cat("\nNumber of variables used in PCA:", length(pca_vars), "\n")
+
+# Build nice names for variables
+nice_names <- c(
+  "wc2.1_30s_bio_1"  = "Annual Mean Temp",
+  "wc2.1_30s_bio_2"  = "Mean Diurnal Range",
+  "wc2.1_30s_bio_3"  = "Isothermality",
+  "wc2.1_30s_bio_4"  = "Temp Seasonality",
+  "wc2.1_30s_bio_5"  = "Max Temp Warmest Month",
+  "wc2.1_30s_bio_6"  = "Min Temp Coldest Month",
+  "wc2.1_30s_bio_7"  = "Temp Annual Range",
+  "wc2.1_30s_bio_8"  = "Mean Temp Wettest Quarter",
+  "wc2.1_30s_bio_9"  = "Mean Temp Driest Quarter",
+  "wc2.1_30s_bio_10" = "Mean Temp Warmest Quarter",
+  "wc2.1_30s_bio_11" = "Mean Temp Coldest Quarter",
+  "wc2.1_30s_bio_12" = "Annual Precipitation",
+  "wc2.1_30s_bio_13" = "Precip Wettest Month",
+  "wc2.1_30s_bio_14" = "Precip Driest Month",
+  "wc2.1_30s_bio_15" = "Precip Seasonality",
+  "wc2.1_30s_bio_16" = "Precip Wettest Quarter",
+  "wc2.1_30s_bio_17" = "Precip Driest Quarter",
+  "wc2.1_30s_bio_18" = "Precip Warmest Quarter",
+  "wc2.1_30s_bio_19" = "Precip Coldest Quarter",
+  "elevation" = "Elevation",
+  "hfi"       = "Human Footprint Index"
+)
+nice_names <- nice_names[intersect(pca_vars, names(nice_names))]
+missing <- setdiff(pca_vars, names(nice_names))
+if (length(missing) > 0) {
+  extra <- setNames(missing, missing)
+  nice_names <- c(nice_names, extra)
+}
+
+# Project points to stack CRS and extract
+all_points_proj <- st_transform(all_points, target_crs)
+pca_data <- data.frame(population = all_points$population)
+
+for (var in pca_vars) {
+  cat("  Extracting:", var, "...")
+  vals <- terra::extract(env_stack[[var]], vect(all_points_proj))[, 2]
+  pca_data[[var]] <- vals
+  cat(" done\n")
+}
+
+pca_data <- pca_data[complete.cases(pca_data), ]
+cat("\nFinal PCA dataset:", nrow(pca_data), "points\n")
+
+# -----------------------------------------------------------------------------
+# 10. Perform PCA
+# -----------------------------------------------------------------------------
+
+cat("\nPerforming PCA...\n")
+pca_result <- PCA(pca_data[, pca_vars], scale.unit = TRUE, graph = FALSE)
+
+eig <- data.frame(
+  PC = 1:nrow(pca_result$eig),
+  Eigenvalue = pca_result$eig[,1],
+  Variance_percent = round(pca_result$eig[,2], 2),
+  Cumulative_percent = round(pca_result$eig[,3], 2)
+)
+cat("First 5 PCs:\n")
+print(eig[1:5, ])
+
+# Scores
+pca_scores <- data.frame(
+  PC1 = pca_result$ind$coord[,1],
+  PC2 = pca_result$ind$coord[,2],
+  population = pca_data$population
+)
+
+# Variable contributions
+var_contrib <- as.data.frame(pca_result$var$contrib)
+var_contrib$Variable <- rownames(var_contrib)
+var_contrib$Nice_Name <- nice_names[var_contrib$Variable]
+var_contrib <- var_contrib %>% arrange(desc(Dim.1))
+
+# Long format for bar chart
+contrib_long <- var_contrib %>%
+  select(Nice_Name, Dim.1, Dim.2) %>%
+  rename(Contribution_PC1 = Dim.1, Contribution_PC2 = Dim.2) %>%
+  pivot_longer(cols = c(Contribution_PC1, Contribution_PC2),
+               names_to = "Component", values_to = "Contribution") %>%
+  mutate(Component = recode(Component, Contribution_PC1 = "PC1", Contribution_PC2 = "PC2"))
+
+# Variable contributions plot
+expected_contrib <- 100 / length(pca_vars)
+top_contrib <- var_contrib %>% filter(Dim.1 > expected_contrib | Dim.2 > expected_contrib)
+if(nrow(top_contrib) > 25) top_contrib <- top_contrib[1:25, ]
+
+p_contrib <- ggplot(contrib_long %>% filter(Nice_Name %in% top_contrib$Nice_Name),
+                    aes(x = reorder(Nice_Name, Contribution), y = Contribution, fill = Component)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6) +
+  coord_flip() +
+  scale_fill_manual(values = c("PC1" = "#1f78b4", "PC2" = "#33a02c")) +
+  labs(title = "Variable contributions to PC1 and PC2",
+       x = "", y = "Contribution (%)") +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom")
+
+ggsave("output/figures/population_pca/pca_variable_contributions.png", p_contrib,
+       width = 10, height = 8, dpi = 300)
+
+# -----------------------------------------------------------------------------
+# 11. Biplot
+# -----------------------------------------------------------------------------
+
+target_pops <- c("Tilarán-Monteverde", "Central Plateau", "Fila Costeña-San Vito")
+centroids <- pca_scores %>%
+  filter(population %in% target_pops) %>%
+  group_by(population) %>%
+  summarise(PC1 = mean(PC1), PC2 = mean(PC2), n = n(), .groups = 'drop')
+
+cat("\nCentroids:\n")
+print(centroids)
+
+# Scale arrows
+var_coords_plot <- as.data.frame(pca_result$var$coord[, 1:2])
+colnames(var_coords_plot) <- c("PC1", "PC2")
+var_coords_plot$nice <- nice_names[rownames(var_coords_plot)]
+max_point_range <- max(abs(pca_scores[, c("PC1","PC2")]))
+max_var_range   <- max(abs(var_coords_plot[, c("PC1","PC2")]))
+scale_factor <- 0.7 * max_point_range / max_var_range
+var_coords_plot <- var_coords_plot %>%
+  mutate(PC1_scaled = PC1 * scale_factor,
+         PC2_scaled = PC2 * scale_factor)
+
+x_lim <- max(abs(pca_scores$PC1)) * 1.2
+y_lim <- max(abs(pca_scores$PC2)) * 1.2
+
+pop_colors <- c("Background" = "gray75",
+                "Tilarán-Monteverde" = "#2E8B57",
+                "Central Plateau" = "#FF6B35",
+                "Fila Costeña-San Vito" = "#9B59B6")
+
+p_biplot <- ggplot() +
+  geom_point(data = pca_scores[pca_scores$population == "Background", ],
+             aes(x = PC1, y = PC2), color = "gray90", alpha = 0.3, size = 0.5) +
+  geom_point(data = pca_scores[pca_scores$population %in% target_pops, ],
+             aes(x = PC1, y = PC2, color = population), alpha = 0.7, size = 1.8) +
+  geom_point(data = centroids, aes(x = PC1, y = PC2, color = population),
+             size = 5, shape = 18) +
+  geom_segment(data = var_coords_plot,
+               aes(x = 0, y = 0, xend = PC1_scaled, yend = PC2_scaled),
+               arrow = arrow(length = unit(0.15,"cm")), color = "blue", alpha = 0.5) +
+  geom_text(data = var_coords_plot,
+            aes(x = PC1_scaled * 1.15, y = PC2_scaled * 1.15, label = nice),
+            color = "blue", size = 2.8) +
+  geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.3) +
+  geom_vline(xintercept = 0, linetype = "dashed", alpha = 0.3) +
+  scale_color_manual(values = pop_colors) +
+  coord_cartesian(xlim = c(-x_lim, x_lim), ylim = c(-y_lim, y_lim)) +
+  labs(title = "PCA – Environmental Niche of Agalychnis annae Populations",
+       subtitle = paste0("PC1: ", eig$Variance_percent[1], "%, PC2: ", eig$Variance_percent[2], "%"),
+       x = paste0("PC1 (", eig$Variance_percent[1], "%)"),
+       y = paste0("PC2 (", eig$Variance_percent[2], "%)"),
+       color = "Population") +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 12),
+        plot.subtitle = element_text(hjust = 0.5, color = "gray40"),
+        legend.position = "bottom")
+
+ggsave("output/figures/population_pca/pca_biplot_populations.png", p_biplot,
+       width = 10, height = 8, dpi = 300)
+
+# -----------------------------------------------------------------------------
+# 12. Boxplots and density plots
+# -----------------------------------------------------------------------------
+
+# Boxplot
+pca_scores_long <- pca_scores %>%
+  filter(population %in% target_pops) %>%
+  pivot_longer(cols = c(PC1, PC2), names_to = "PC", values_to = "Score")
+
+p_box <- ggplot(pca_scores_long, aes(x = population, y = Score, fill = population)) +
+  geom_boxplot(alpha = 0.8, outlier.size = 0.8) +
+  facet_wrap(~ PC, scales = "free_y") +
+  scale_fill_manual(values = pop_colors) +
+  labs(title = "PCA Scores by Population", x = "", y = "Score") +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        legend.position = "none",
+        strip.background = element_rect(fill = "grey90"),
+        strip.text = element_text(face = "bold"),
+        axis.text.x = element_text(angle = 30, hjust = 1))
+
+ggsave("output/figures/population_pca/pca_boxplots.png", p_box,
+       width = 8, height = 6, dpi = 300)
+
+# Density plot with contours
+p_density <- ggplot() +
+  geom_point(data = pca_scores[pca_scores$population == "Background", ],
+             aes(x = PC1, y = PC2), color = "gray90", alpha = 0.2, size = 0.3) +
+  stat_density2d(data = pca_scores[pca_scores$population %in% target_pops, ],
+                 aes(x = PC1, y = PC2, color = population), size = 0.7) +
+  geom_point(data = pca_scores[pca_scores$population %in% target_pops, ],
+             aes(x = PC1, y = PC2, color = population), alpha = 0.5, size = 1.2) +
+  geom_point(data = centroids, aes(x = PC1, y = PC2, color = population),
+             size = 5, shape = 18) +
+  scale_color_manual(values = pop_colors) +
+  geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.3) +
+  geom_vline(xintercept = 0, linetype = "dashed", alpha = 0.3) +
+  coord_fixed(ratio = 1) +
+  labs(title = "PCA Density Plot – Population Concentration",
+       subtitle = paste0("PC1: ", eig$Variance_percent[1], "%, PC2: ", eig$Variance_percent[2], "%"),
+       x = paste0("PC1 (", eig$Variance_percent[1], "%)"),
+       y = paste0("PC2 (", eig$Variance_percent[2], "%)"),
+       color = "Population") +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        plot.subtitle = element_text(hjust = 0.5, color = "grey40"),
+        legend.position = "bottom")
+
+ggsave("output/figures/population_pca/pca_density_populations.png", p_density,
+       width = 8, height = 7, dpi = 300)
+
+# -----------------------------------------------------------------------------
+# 13. Wilcoxon tests
+# -----------------------------------------------------------------------------
+
+cat("\nPairwise Wilcoxon tests (PC1 and PC2):\n")
+test_results <- data.frame()
+for (pc in c("PC1","PC2")) {
+  for (i in 1:(length(target_pops)-1)) {
+    for (j in (i+1):length(target_pops)) {
+      pop1 <- target_pops[i]
+      pop2 <- target_pops[j]
+      vals1 <- pca_scores[pca_scores$population == pop1, pc]
+      vals2 <- pca_scores[pca_scores$population == pop2, pc]
+      test <- wilcox.test(vals1, vals2)
+      test_results <- rbind(test_results, data.frame(
+        PC = pc,
+        Comparison = paste(pop1, "vs", pop2),
+        Mean1 = round(mean(vals1), 3),
+        Mean2 = round(mean(vals2), 3),
+        Difference = round(mean(vals1) - mean(vals2), 3),
+        p_value = format.pval(test$p.value, digits = 4)
+      ))
+    }
+  }
+}
+print(test_results)
+
+# -----------------------------------------------------------------------------
+# 14. Export Excel file
+# -----------------------------------------------------------------------------
+
+excel_path <- "output/figures/population_pca/pca_results.xlsx"
+write_xlsx(list(
+  Eigenvalues = eig,
+  Variable_Contributions = var_contrib %>% select(Variable, Nice_Name, everything()),
+  Centroids = centroids %>% rename(Population = population, N_points = n),
+  Wilcoxon_Tests = test_results
+), path = excel_path)
+
+cat("\nExcel exported to:", excel_path, "\n")
+
+# -----------------------------------------------------------------------------
+# 15. Final summary
+# -----------------------------------------------------------------------------
+
+cat("\n", rep("=", 60), "\n", sep = "")
+cat("ALL ANALYSES COMPLETED SUCCESSFULLY\n")
+cat(rep("=", 60), "\n\n", sep = "")
+
+cat("Outputs:\n")
+cat("  - Environmental maps: output/figures/maps_30s/individual/\n")
+cat("  - Map variations:     output/figures/maps_30s/variations/\n")
+cat("  - PCA results:        output/figures/population_pca/\n\n")
+
+cat("Observation periods for maps:\n")
+cat(sprintf("  Pre-2000 (yellow circles) : %d records\n", n_pre))
+cat(sprintf("  Post-2000 (dark red triangles) : %d records\n", n_post))
+
+cat("\n=== END OF SCRIPT ===\n")
