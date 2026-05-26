@@ -1,0 +1,316 @@
+# ============================================================================
+# SUPPLEMENTARY CODE A: Data cleaning and mapping for Agalychnis annae
+# ============================================================================
+# Original authors: Hector Zumbado and Victor Acosta
+# Improved and standardized with assistance from DeepSeek (AI assistant)
+# Date: 2026-05-25
+#
+# This script performs the entire workflow:
+# 1. Downloads GBIF data (requires credentials; commented out by default)
+# 2. Cleans GBIF, iNaturalist, UCR, and citizen science (media) data
+# 3. Merges all occurrence records into a full dataset
+# 4. Creates temporal subsets (pre-2000 and post-2000) and maps
+#
+# All file paths are relative. Required folders:
+#   data/raw/        - place raw input files here
+#   data/processed/  - cleaned outputs will be saved here
+#   output/figures/  - maps will be saved here
+#   shapefiles/      - place shapefiles (costa rica, countries, etc.) here
+#
+# Note: Some steps may require user intervention (e.g., providing GBIF credentials
+#       or downloading external datasets). Uncomment sections as needed.
+# ============================================================================
+
+# ============================================================================
+# 0. SETUP
+# ============================================================================
+
+rm(list = ls())
+
+# Load required libraries
+library(sf)
+library(tmap)
+library(tidyverse)
+# library(rgbif)        # Uncomment if GBIF download is needed
+# library(lubridate)    # Already loaded via tidyverse
+
+# Create directories if they don't exist
+dir.create("data/raw", showWarnings = FALSE, recursive = TRUE)
+dir.create("data/processed", showWarnings = FALSE, recursive = TRUE)
+dir.create("output/figures", showWarnings = FALSE, recursive = TRUE)
+
+# Species name (used for file naming)
+my_species <- "Agalychnis_annae"
+
+# ============================================================================
+# 1. LOAD SHAPEFILES (required for spatial filtering and maps)
+# ============================================================================
+
+# The code expects shapefiles with patterns 'crp' (Costa Rica polygon) and 'co' (countries)
+# Place your shapefiles in the 'shapefiles/' folder
+shapefiles <- list.files("shapefiles",
+                         pattern = "(crp|co)",
+                         full.names = TRUE)
+
+if (length(shapefiles) == 0) {
+  warning("No shapefiles found. Spatial filtering and maps will be skipped.")
+  costa_rica <- NULL
+  countries <- NULL
+} else {
+  shp_list <- map(shapefiles, ~ read_sf(.x) %>% st_make_valid())
+  names(shp_list) <- c("costa_rica", "countries")
+  list2env(shp_list, .GlobalEnv)
+}
+
+# ============================================================================
+# 2. GBIF DATA DOWNLOAD (optional - requires rgbif credentials)
+# ============================================================================
+
+# Uncomment and edit the following block if you need to download fresh GBIF data.
+# Replace 'user', 'pwd', 'email' with your own GBIF credentials.
+
+if (FALSE) {  # Change to TRUE to run
+  library(rgbif)
+  
+  species <- "Agalychnis annae"
+  key <- name_backbone(species) %>% pull(usageKey)   # key = 2428195
+  
+  gbif_download <- occ_download(
+    pred("taxonKey", key),
+    format = "SIMPLE_CSV",
+    user = "your_username",
+    pwd = "your_password",
+    email = "your_email@example.com"
+  )
+  
+  # Save download metadata (optional)
+  gbif_download %>% write_rds(paste0("data/raw/", my_species, "_key.rds"))
+  
+  # Wait for download to complete (may take several minutes)
+  occ_download_wait(gbif_download)
+  
+  # Import data
+  data <- occ_download_get(gbif_download, path = "data/raw", overwrite = TRUE) %>%
+    occ_download_import()
+  
+  # Save as CSV and RDS
+  data %>% write_csv(paste0("data/raw/", my_species, "_gbif_raw.csv"))
+  data %>% write_rds(paste0("data/raw/", my_species, "_gbif_raw.rds"))
+}
+
+# ============================================================================
+# 3. CLEAN GBIF DATA
+# ============================================================================
+
+gbif_occurrences_raw <- read_rds(paste0("data/raw/", my_species, "_gbif_raw.rds"))
+
+gbif_occurrences <- gbif_occurrences_raw %>%
+  filter(institutionCode != "iNaturalist") %>%
+  select(
+    id = gbifID,
+    species,
+    month,
+    day,
+    year,
+    date = eventDate,
+    x = decimalLongitude,
+    y = decimalLatitude,
+    locality,
+    institution = institutionCode,
+    accuracy = coordinateUncertaintyInMeters
+  ) %>%
+  filter(!if_any(c(year, x, y), ~ is.na(.x))) %>%
+  filter(year >= 1950) %>%
+  mutate(
+    across(month:day, ~ replace_na(.x, 1))
+  ) %>%
+  unite("date", c(year, month, day), sep = "-") %>%
+  mutate(date = ymd(date)) %>%
+  # filter(accuracy < 5000) %>%   # optional uncertainty filter
+  st_as_sf(coords = c("x", "y"), crs = 4326, remove = FALSE)
+
+# Keep only records within Costa Rica (if shapefile exists)
+if (exists("costa_rica")) {
+  gbif_occurrences <- gbif_occurrences %>% st_filter(costa_rica)
+}
+
+gbif_occurrences <- gbif_occurrences %>%
+  mutate(
+    source = "GBIF",
+    id = paste("gbif", id, sep = "_")
+  )
+
+# Remove a dubious locality (optional)
+if ("locality" %in% colnames(gbif_occurrences)) {
+  gbif_occurrences <- gbif_occurrences %>% filter(locality != "Pandora")
+}
+
+# Save cleaned GBIF occurrences
+write_rds(gbif_occurrences, paste0("data/processed/", my_species, "_gbif_occs_clean.rds"))
+
+# ============================================================================
+# 4. CLEAN iNATURALIST DATA
+# ============================================================================
+
+inat_occurrences <- read_rds("data/raw/inat_annae.rds") %>%
+  filter(species == "Agalychnis annae") %>%
+  distinct(id, x, y, .keep_all = TRUE) %>%
+  filter(!if_any(c(x, y), is.na)) %>%
+  filter(x < -82.8 & x > -85)   # Remove records in Nicoya and Limon
+
+write_rds(inat_occurrences, paste0("data/processed/", my_species, "_inat_occs_clean.rds"))
+
+# ============================================================================
+# 5. CLEAN UCR DATA
+# ============================================================================
+
+ucr_occurrences <- read_rds(paste0("data/raw/", my_species, "_ucr.rds")) %>%
+  filter(county != "Parrita")
+
+write_rds(ucr_occurrences, paste0("data/processed/", my_species, "_ucr_occs_clean.rds"))
+
+# ============================================================================
+# 6. CLEAN CITIZEN SCIENCE (MEDIA) DATA
+# ============================================================================
+
+occurrences_media <- read_rds(paste0("data/raw/", my_species, "_raw_media.rds")) %>%
+  mutate(source = "Citizen Data") %>%
+  filter(!if_any(c(x, y), is.na))
+
+write_rds(occurrences_media, paste0("data/processed/", my_species, "_media_occs_clean.rds"))
+
+# ============================================================================
+# 7. COMBINE FULL DATASET (Costa Rica + Panama)
+# ============================================================================
+
+# Read all cleaned occurrences
+list.files("data/processed", pattern = "clean", full.names = TRUE) %>%
+  map(~ read_rds(.x)) %>%
+  set_names("annae_gbif", "annae_inat", "annae_media", "annae_ucr") %>%
+  list2env(.GlobalEnv)
+
+# Panama data (provided as CSV)
+annae_panama <- read_csv(paste0("data/raw/", my_species, "_panama.csv")) %>%
+  mutate(id = "Panama")
+
+# Assemble Costa Rica records
+annae_cr <- annae_gbif %>%
+  st_drop_geometry() %>%
+  select(!any_of(c("locality", "institution"))) %>%
+  bind_rows(annae_inat %>% mutate(id = as.character(id))) %>%
+  bind_rows(annae_ucr %>% mutate(id = as.character(id)) %>% select(!county)) %>%
+  mutate(year = year(date)) %>%
+  select(!date) %>%
+  bind_rows(annae_media %>% mutate(id = paste0("media_", 1:nrow(annae_media))))
+
+# Combine with Panama
+annae_occs <- bind_rows(annae_cr, annae_panama) %>%
+  filter(!if_any(c(x, y), is.na)) %>%
+  filter(y > 0 | x < 0)   # ensure reasonable coordinates
+
+# Remove temporary objects
+rm(annae_gbif, annae_inat, annae_media, annae_ucr, annae_cr, annae_panama)
+
+# Save full dataset
+write_rds(annae_occs, paste0("data/processed/", my_species, "_full_dataset.rds"))
+
+# ============================================================================
+# 8. TEMPORAL SUBSETS (pre-2000 and post-2000)
+# ============================================================================
+
+annae_occs <- read_rds(paste0("data/processed/", my_species, "_full_dataset.rds")) %>%
+  filter(id != "Panama")   # Keep only Costa Rica for temporal analysis
+
+annae_pre <- annae_occs %>% filter(year < 2000)
+annae_post <- annae_occs %>% filter(year >= 2000)
+
+write_rds(annae_pre, paste0("data/processed/", my_species, "_predecline.rds"))
+write_rds(annae_post, paste0("data/processed/", my_species, "_postdecline.rds"))
+
+# ============================================================================
+# 9. OPTIONAL: GENERATE MAPS (requires shapefiles)
+# ============================================================================
+
+# Only proceed if shapefiles are available
+if (exists("countries") && !is.null(countries)) {
+  
+  # Common map extent for Costa Rica
+  extent <- st_bbox(c(xmin = -86.5, xmax = -82.5, ymin = 7.5, ymax = 11.5), crs = 4326) %>%
+    st_as_sfc()
+  
+  # ----- Map of cleaned GBIF occurrences (example) -----
+  gbif_sf <- tryCatch(
+    read_rds(paste0("data/processed/", my_species, "_gbif_occs_clean.rds")) %>%
+      st_as_sf(coords = c("x", "y"), crs = 4326),
+    error = function(e) NULL
+  )
+  
+  if (!is.null(gbif_sf)) {
+    map_gbif <- countries %>%
+      tm_shape(bb = extent) +
+      tm_graticules(lines = FALSE) +
+      tm_polygons() +
+      tm_shape(gbif_sf) +
+      tm_dots(size = 0.3, shape = 21, col = "red") +
+      tm_compass(position = c("right", "top"), text.size = 0.5, type = "4star") +
+      tm_scalebar(position = c("left", "bottom"), text.size = 0.8, breaks = c(0, 50, 100)) +
+      tm_layout(legend.position = c(0.1, 0.3), bg.color = "lightblue", legend.bg.color = "white")
+    
+    tmap_save(map_gbif, paste0("output/figures/", my_species, "_gbif_clean.jpg"), height = 7, width = 8, dpi = 300)
+  }
+  
+  # ----- Map of full Costa Rica dataset (by source) -----
+  annae_cr_sf <- annae_occs %>%
+    st_as_sf(coords = c("x", "y"), crs = 4326, remove = FALSE)
+  
+  map_full <- countries %>%
+    tm_shape(bb = extent) +
+    tm_graticules(lines = FALSE, labels.size = 0.8) +
+    tm_polygons(fill = "cornsilk3") +
+    tm_shape(annae_cr_sf) +
+    tm_symbols(fill = "source", size = 0.5, col = "black",
+               fill.legend = tm_legend("Source"),
+               fill.scale = tm_scale_categorical(values = "brewer.set2")) +
+    tm_compass(position = c("left", "top"), text.size = 0.5, type = "4star") +
+    tm_scalebar(position = c("right", "bottom"), text.size = 0.5, breaks = c(0, 50, 100)) +
+    tm_layout(legend.position = c(0.03, 0.3), bg.color = "lightblue1", legend.bg.color = "white",
+              legend.text.size = 1, legend.title.size = 1.2, legend.title.fontface = "bold")
+  
+  tmap_save(map_full, paste0("output/figures/", my_species, "_distri_annae_CR.jpg"), height = 7, width = 8, dpi = 300)
+  
+  # ----- Temporal comparison map (pre vs post 2000) -----
+  # Additional shapefiles: provincias (provinces) – optional; skip if missing
+  provincias <- tryCatch(read_sf("shapefiles/provincias.shp") %>% st_make_valid(), error = function(e) NULL)
+  
+  map_time <- countries %>%
+    tm_shape(bb = extent) +
+    tm_graticules(lines = FALSE, labels.size = 0.8) +
+    tm_polygons(col = "gray50") +
+    tm_shape(countries) + tm_borders(col = "gray50", lwd = 2)
+  
+  if (!is.null(provincias)) {
+    map_time <- map_time + tm_shape(provincias) + tm_borders(col = "gray50", lwd = 2)
+  }
+  
+  map_time <- map_time +
+    tm_shape(annae_pre %>% st_as_sf(coords = c("x", "y"), crs = 4326)) +
+    tm_dots(fill = "blue", size = 0.3) +
+    tm_shape(annae_post %>% st_as_sf(coords = c("x", "y"), crs = 4326)) +
+    tm_symbols(fill = "tan1", size = 0.3) +
+    tm_add_legend(title = "Observation date", "symbol", labels = "Before 2000", fill = "blue") +
+    tm_add_legend("symbol", labels = "2000 or after", fill = "tan1") +
+    tm_compass(position = c("left", "top"), text.size = 0.3, type = "4star") +
+    tm_scalebar(position = c("right", "bottom"), text.size = 0.8, breaks = c(0, 50, 100)) +
+    tm_layout(legend.position = c(0.03, 0.3), bg.color = "lightblue1", legend.bg.color = "white",
+              legend.text.size = 1, legend.title.size = 1.2, legend.title.fontface = "bold")
+  
+  tmap_save(map_time, paste0("output/figures/", my_species, "_CR_time.jpg"), height = 7, width = 8, dpi = 300)
+  
+  message("All maps saved to 'output/figures/'")
+} else {
+  message("Shapefiles not found. Maps were not generated.")
+}
+
+# ============================================================================
+# END OF SCRIPT
+# ============================================================================
