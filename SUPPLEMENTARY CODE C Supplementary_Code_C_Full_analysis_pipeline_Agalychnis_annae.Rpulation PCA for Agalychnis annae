@@ -1,0 +1,691 @@
+# =============================================================================
+# SUPPLEMENTARY CODE C
+# Full analytical pipeline for Agalychnis annae
+# -----------------------------------------------------------------------------
+# This script reproduces the complete analysis reported in the manuscript:
+#   1. Loading and cleaning of occurrence records
+#   2. Spatial thinning (1 km)
+#   3. Variable selection (correlation filtering, |r| > 0.7)
+#   4. Calibration area (10-km buffer around occurrences)
+#   5. Background sampling (random, n = 10,000)
+#   6. Ensemble species distribution modeling (biomod2: GLM, GAM, RF, MaxNet)
+#   7. Ensemble forecasting (EMmean weighted by TSS)
+#   8. Projection to Costa Rica and suitability maps
+#   9. Niche overlap and dynamics (ecospat): D, I, stability, expansion,
+#      unfilling, equivalency and similarity tests (100 permutations each)
+#  10. Variable importance (permutation-based, averaged across 36 model runs)
+#  11. Population PCA (FactoMineR) for Monteverde, Central Plateau, San Vito
+#
+# Input data:
+#   data/processed/Agalychnis_annae_full_dataset.rds  – cleaned occurrences
+#   rasters/env_pre_30s.tif                           – pre-2000 env. stack
+#   rasters/env_post_30s.tif                          – post-2000 env. stack
+#   shapefiles/costa_rica_wgs84.gpkg                  – national boundary
+#
+# Outputs:
+#   output/ensemble_model_versionC_hfi2020_1km/
+#     ├── random_bg/
+#     │   ├── models/         – fitted biomod2 and ensemble models (.rds)
+#     │   ├── projections/    – suitability rasters (pre, post, diff)
+#     │   └── niche_results.rds
+#     ├── niche_analysis_random/
+#     │   ├── png/, svg/      – niche overlap and dynamics figures
+#     │   └── excel/          – variable importance and niche metrics
+#     ├── figures_normalized/ – suitability maps (PNG/PDF)
+#     └── REAL_VALUES_MANUSCRIPT.xlsx – all numerical results
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# 0. SETUP
+# -----------------------------------------------------------------------------
+rm(list = ls())
+
+required_packages <- c(
+  "terra", "sf", "dplyr", "tidyr", "ggplot2", "patchwork",
+  "ggspatial", "scales", "viridis", "usdm", "biomod2",
+  "ecospat", "ade4", "FactoMineR", "factoextra", "openxlsx"
+)
+
+for (pkg in required_packages) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg, dependencies = TRUE)
+  }
+  suppressPackageStartupMessages(library(pkg, character.only = TRUE))
+}
+
+set.seed(123)
+
+base_dir    <- "C:/annae_data"
+output_base <- file.path(base_dir, "output/ensemble_model_versionC_hfi2020_1km")
+dir.create(output_base, recursive = TRUE, showWarnings = FALSE)
+dir.create(file.path(output_base, "checkpoints"), recursive = TRUE, showWarnings = FALSE)
+
+# -----------------------------------------------------------------------------
+# 1. LOAD DATA
+# -----------------------------------------------------------------------------
+cat("\n=== 1. LOADING DATA ===\n")
+
+env_pre  <- rast(file.path(base_dir, "rasters/env_pre_30s.tif"))
+env_post <- rast(file.path(base_dir, "rasters/env_post_30s.tif"))
+
+# Remove HFP 1993 layer if present; only HII 2020 is used in the manuscript
+if ("hfi1993" %in% names(env_pre))  env_pre  <- env_pre[[-which(names(env_pre)  == "hfi1993")]]
+if ("hfi1993" %in% names(env_post)) env_post <- env_post[[-which(names(env_post) == "hfi1993")]]
+
+occ_all <- readRDS(file.path(base_dir, "data/processed/Agalychnis_annae_full_dataset.rds")) %>%
+  filter(id != "Panama")
+
+occ_pre  <- occ_all %>% filter(year <  2000)
+occ_post <- occ_all %>% filter(year >= 2000)
+
+cat(sprintf("Occurrences: %d total (%d pre-2000, %d post-2000)\n",
+            nrow(occ_all), nrow(occ_pre), nrow(occ_post)))
+
+cr <- st_read(file.path(base_dir, "shapefiles/costa_rica_wgs84.gpkg"), quiet = TRUE)
+cr <- st_transform(cr, crs(env_pre))
+cr_vect <- vect(cr)
+
+# -----------------------------------------------------------------------------
+# 2. SPATIAL THINNING (1 km)
+# -----------------------------------------------------------------------------
+cat("\n=== 2. SPATIAL THINNING (1 km) ===\n")
+
+thin_occurrences <- function(occ_df, raster_template, dist_km = 1) {
+  if (nrow(occ_df) < 2) return(occ_df)
+  res_deg <- dist_km / 111.32
+  r_thin  <- rast(ext(raster_template),
+                  resolution = res_deg,
+                  crs        = crs(raster_template))
+  r_thin[] <- 1:ncell(r_thin)
+  xy <- as.matrix(occ_df[, c("x", "y")])
+  occ_df[!duplicated(cellFromXY(r_thin, xy)), ]
+}
+
+occ_pre_thin  <- thin_occurrences(occ_pre,  env_pre[[1]],  dist_km = 1)
+occ_post_thin <- thin_occurrences(occ_post, env_post[[1]], dist_km = 1)
+
+cat(sprintf("Pre-2000: %d -> %d; Post-2000: %d -> %d\n",
+            nrow(occ_pre),  nrow(occ_pre_thin),
+            nrow(occ_post), nrow(occ_post_thin)))
+
+saveRDS(list(pre = occ_pre_thin, post = occ_post_thin),
+        file.path(output_base, "checkpoints", "thinned_occurrences.rds"))
+
+# -----------------------------------------------------------------------------
+# 3. VARIABLE SELECTION (correlation filter, |r| > 0.7)
+# -----------------------------------------------------------------------------
+cat("\n=== 3. VARIABLE SELECTION (vifcor) ===\n")
+
+all_occ_coords <- rbind(occ_pre_thin, occ_post_thin)[, c("x", "y")]
+pred_vals      <- terra::extract(env_pre[[names(env_pre)]], all_occ_coords)
+pred_vals      <- na.omit(pred_vals)
+
+vif_result    <- usdm::vifcor(pred_vals, th = 0.7)
+selected_vars <- vif_result@results$Variables
+selected_vars <- selected_vars[selected_vars != "ID"]
+
+cat("Retained variables:", paste(selected_vars, collapse = ", "), "\n")
+saveRDS(selected_vars, file.path(output_base, "checkpoints", "selected_vars.rds"))
+
+env_pre_sel  <- env_pre[[selected_vars]]
+env_post_sel <- env_post[[selected_vars]]
+
+# -----------------------------------------------------------------------------
+# 4. CALIBRATION AREA (10-km buffer around all occurrences)
+# -----------------------------------------------------------------------------
+cat("\n=== 4. CALIBRATION AREA (10-km buffer) ===\n")
+
+all_occ_sf   <- st_as_sf(rbind(occ_pre, occ_post),
+                         coords = c("x", "y"), crs = 4326)
+buffered     <- st_buffer(all_occ_sf, dist = 10000)
+buffered     <- st_union(buffered)
+buffered     <- st_make_valid(buffered)
+calib_poly   <- st_transform(buffered, crs = crs(env_pre_sel))
+calib_area   <- vect(calib_poly)
+
+cat(sprintf("Calibration area: %.1f km2\n",
+            round(as.numeric(st_area(calib_poly)) / 1e6, 1)))
+
+env_pre_calib  <- crop(env_pre_sel,  calib_area, mask = TRUE)
+env_post_calib <- crop(env_post_sel, calib_area, mask = TRUE)
+
+st_write(calib_poly,
+         file.path(output_base, "checkpoints", "calibration_area.gpkg"),
+         delete_layer = TRUE)
+
+# -----------------------------------------------------------------------------
+# 5. BACKGROUND POINTS (random, n = 10,000)
+# -----------------------------------------------------------------------------
+cat("\n=== 5. BACKGROUND POINTS ===\n")
+
+set.seed(123)
+bg_points <- spatSample(calib_area, size = 10000, method = "random")
+bg_xy     <- crds(bg_points)
+bg_df     <- as.data.frame(bg_xy)
+names(bg_df) <- c("x", "y")
+bg_df     <- na.omit(bg_df)
+bg_df     <- bg_df[!duplicated(bg_df), ]
+
+bg_vals_pre  <- terra::extract(env_pre_calib,  bg_df) %>% na.omit()
+bg_vals_post <- terra::extract(env_post_calib, bg_df) %>% na.omit()
+
+saveRDS(list(bg_df = bg_df,
+             bg_vals_pre  = bg_vals_pre,
+             bg_vals_post = bg_vals_post),
+        file.path(output_base, "random_bg", "background_data.rds"))
+
+cat(sprintf("Generated %d background points\n", nrow(bg_df)))
+
+# -----------------------------------------------------------------------------
+# 6. ENSEMBLE SPECIES DISTRIBUTION MODELING (biomod2)
+# -----------------------------------------------------------------------------
+cat("\n=== 6. ENSEMBLE SDM (biomod2) ===\n")
+
+coords_pre  <- as.data.frame(occ_pre_thin[,  c("x", "y")])
+coords_post <- as.data.frame(occ_post_thin[, c("x", "y")])
+
+myBiomodData_pre <- BIOMOD_FormatingData(
+  resp.var       = rep(1, nrow(occ_pre_thin)),
+  expl.var       = env_pre_calib,
+  resp.xy        = coords_pre,
+  resp.name      = "Agalychnis_annae_pre",
+  PA.nb.rep      = 1,
+  PA.nb.absences = nrow(occ_pre_thin),
+  PA.strategy    = "random",
+  filter.raster  = TRUE
+)
+
+myBiomodData_post <- BIOMOD_FormatingData(
+  resp.var       = rep(1, nrow(occ_post_thin)),
+  expl.var       = env_post_calib,
+  resp.xy        = coords_post,
+  resp.name      = "Agalychnis_annae_post",
+  PA.nb.rep      = 1,
+  PA.nb.absences = nrow(occ_post_thin),
+  PA.strategy    = "random",
+  filter.raster  = TRUE
+)
+
+myBiomodModelOut_pre <- BIOMOD_Modeling(
+  bm.format    = myBiomodData_pre,
+  modeling.id  = "pre_random",
+  models       = c("MAXNET", "RF", "GLM", "GAM"),
+  OPT.strategy = "default",
+  CV.strategy  = "random",
+  CV.nb.rep    = 3,
+  CV.perc      = 0.7,
+  var.import   = 3,
+  metric.eval  = c("TSS", "AUCroc"),
+  seed.val     = 123
+)
+
+myBiomodModelOut_post <- BIOMOD_Modeling(
+  bm.format    = myBiomodData_post,
+  modeling.id  = "post_random",
+  models       = c("MAXNET", "RF", "GLM", "GAM"),
+  OPT.strategy = "default",
+  CV.strategy  = "random",
+  CV.nb.rep    = 3,
+  CV.perc      = 0.7,
+  var.import   = 3,
+  metric.eval  = c("TSS", "AUCroc"),
+  seed.val     = 456
+)
+
+saveRDS(myBiomodModelOut_pre,
+        file.path(output_base, "random_bg", "models", "model_out_pre_random.rds"))
+saveRDS(myBiomodModelOut_post,
+        file.path(output_base, "random_bg", "models", "model_out_post_random.rds"))
+
+# -----------------------------------------------------------------------------
+# 7. ENSEMBLE FORECASTING (EMmean weighted by TSS)
+# -----------------------------------------------------------------------------
+cat("\n=== 7. ENSEMBLE FORECASTING ===\n")
+
+myBiomodEM_pre <- BIOMOD_EnsembleModeling(
+  bm.mod              = myBiomodModelOut_pre,
+  models.chosen       = "all",
+  em.by               = "all",
+  metric.select       = "TSS",
+  metric.select.thresh = 0.6,
+  em.algo             = "EMmean"
+)
+
+myBiomodEM_post <- BIOMOD_EnsembleModeling(
+  bm.mod              = myBiomodModelOut_post,
+  models.chosen       = "all",
+  em.by               = "all",
+  metric.select       = "TSS",
+  metric.select.thresh = 0.6,
+  em.algo             = "EMmean"
+)
+
+saveRDS(myBiomodEM_pre,
+        file.path(output_base, "random_bg", "models", "ensemble_pre_random.rds"))
+saveRDS(myBiomodEM_post,
+        file.path(output_base, "random_bg", "models", "ensemble_post_random.rds"))
+
+# -----------------------------------------------------------------------------
+# 8. PROJECTION TO COSTA RICA AND SUITABILITY MAPS
+# -----------------------------------------------------------------------------
+cat("\n=== 8. PROJECTION AND MAPS ===\n")
+
+env_pre_mask  <- terra::mask(env_pre_sel,  cr_vect)
+env_post_mask <- terra::mask(env_post_sel, cr_vect)
+
+proj_pre <- BIOMOD_Projection(
+  bm.mod           = myBiomodModelOut_pre,
+  proj.name        = "current_pre_random",
+  new.env          = env_pre_mask,
+  models.chosen    = "all",
+  build.clamping.mask = FALSE
+)
+
+proj_post <- BIOMOD_Projection(
+  bm.mod           = myBiomodModelOut_post,
+  proj.name        = "current_post_random",
+  new.env          = env_post_mask,
+  models.chosen    = "all",
+  build.clamping.mask = FALSE
+)
+
+proj_em_pre  <- BIOMOD_EnsembleForecasting(bm.em = myBiomodEM_pre,  bm.proj = proj_pre)
+proj_em_post <- BIOMOD_EnsembleForecasting(bm.em = myBiomodEM_post, bm.proj = proj_post)
+
+pre_rast  <- get_predictions(proj_em_pre)
+post_rast <- get_predictions(proj_em_post)
+diff_rast <- post_rast - pre_rast
+
+writeRaster(pre_rast,
+            file.path(output_base, "random_bg", "projections", "suitability_pre_ensemble.tif"),
+            overwrite = TRUE)
+writeRaster(post_rast,
+            file.path(output_base, "random_bg", "projections", "suitability_post_ensemble.tif"),
+            overwrite = TRUE)
+writeRaster(diff_rast,
+            file.path(output_base, "random_bg", "projections", "suitability_diff_ensemble.tif"),
+            overwrite = TRUE)
+
+# Normalized maps for publication
+normalize <- function(r) {
+  r_min <- global(r, "min", na.rm = TRUE)$min
+  r_max <- global(r, "max", na.rm = TRUE)$max
+  (r - r_min) / (r_max - r_min)
+}
+
+pre_norm  <- normalize(pre_rast)
+post_norm <- normalize(post_rast)
+diff_norm <- post_norm - pre_norm
+
+fig_dir <- file.path(output_base, "figures_normalized")
+dir.create(fig_dir, recursive = TRUE, showWarnings = FALSE)
+
+theme_map <- theme_void(base_size = 10) +
+  theme(
+    plot.title      = element_text(hjust = 0.5, face = "bold", size = 10),
+    plot.subtitle   = element_text(hjust = 0.5, size = 8, color = "grey40"),
+    legend.position = "right",
+    plot.margin     = margin(2, 2, 2, 2)
+  )
+
+suit_palette <- scale_fill_viridis_c(
+  option = "viridis", name = "Suitability", limits = c(0, 1),
+  na.value = "transparent", begin = 0.05, end = 0.95
+)
+
+diff_palette <- scale_fill_gradient2(
+  low = "#2166AC", mid = "#F7F7F7", high = "#D73027",
+  midpoint = 0, name = "Change", limits = c(-0.5, 0.5),
+  oob = scales::squish, na.value = "transparent"
+)
+
+occ_pre_plot  <- st_as_sf(occ_pre_thin,  coords = c("x", "y"), crs = 4326) %>%
+  st_transform(crs(pre_norm))
+occ_post_plot <- st_as_sf(occ_post_thin, coords = c("x", "y"), crs = 4326) %>%
+  st_transform(crs(post_norm))
+
+cr_ext <- st_union(st_buffer(cr, dist = 0.5))
+
+p_pre <- ggplot() +
+  geom_tile(data = as.data.frame(pre_norm, xy = TRUE, na.rm = TRUE),
+            aes(x = x, y = y, fill = suitability_pre_ensemble)) +
+  geom_sf(data = cr_ext, fill = NA, color = "gray85", linewidth = 0.15) +
+  geom_sf(data = cr,     fill = NA, color = "gray30", linewidth = 0.4) +
+  geom_sf(data = occ_pre_plot, color = "black", fill = "#FFD700",
+          size = 0.8, shape = 21, alpha = 0.9) +
+  suit_palette +
+  annotation_scale(location = "bl", width_hint = 0.15, text_cex = 0.4) +
+  annotation_north_arrow(location = "tr", which_north = "true",
+                         height = unit(0.35, "cm"), width = unit(0.35, "cm")) +
+  labs(title = "Pre-2000 suitability", subtitle = paste0("n = ", nrow(occ_pre_thin))) +
+  coord_sf(expand = FALSE) + theme_map
+
+p_post <- ggplot() +
+  geom_tile(data = as.data.frame(post_norm, xy = TRUE, na.rm = TRUE),
+            aes(x = x, y = y, fill = suitability_post_ensemble)) +
+  geom_sf(data = cr_ext, fill = NA, color = "gray85", linewidth = 0.15) +
+  geom_sf(data = cr,     fill = NA, color = "gray30", linewidth = 0.4) +
+  geom_sf(data = occ_post_plot, color = "black", fill = "#FF4500",
+          size = 0.8, shape = 24, alpha = 0.9) +
+  suit_palette +
+  annotation_scale(location = "bl", width_hint = 0.15, text_cex = 0.4) +
+  annotation_north_arrow(location = "tr", which_north = "true",
+                         height = unit(0.35, "cm"), width = unit(0.35, "cm")) +
+  labs(title = "Post-2000 suitability", subtitle = paste0("n = ", nrow(occ_post_thin))) +
+  coord_sf(expand = FALSE) + theme_map
+
+p_diff <- ggplot() +
+  geom_tile(data = as.data.frame(diff_norm, xy = TRUE, na.rm = TRUE),
+            aes(x = x, y = y, fill = suitability_post_ensemble)) +
+  geom_sf(data = cr_ext, fill = NA, color = "gray85", linewidth = 0.15) +
+  geom_sf(data = cr,     fill = NA, color = "gray30", linewidth = 0.4) +
+  diff_palette +
+  annotation_scale(location = "bl", width_hint = 0.15, text_cex = 0.4) +
+  annotation_north_arrow(location = "tr", which_north = "true",
+                         height = unit(0.35, "cm"), width = unit(0.35, "cm")) +
+  labs(title = "Suitability change", subtitle = "Post - pre") +
+  coord_sf(expand = FALSE) + theme_map
+
+combined <- (p_pre | p_post) / p_diff +
+  plot_annotation(tag_levels = "A", tag_prefix = "(", tag_suffix = ")")
+
+ggsave(file.path(fig_dir, "suitability_maps_random_normalized.png"),
+       combined, width = 8, height = 9, dpi = 600, bg = "white")
+ggsave(file.path(fig_dir, "suitability_maps_random_normalized.pdf"),
+       combined, width = 8, height = 9, device = "pdf", bg = "white")
+
+# -----------------------------------------------------------------------------
+# 9. NICHE OVERLAP AND DYNAMICS (ecospat)
+# -----------------------------------------------------------------------------
+cat("\n=== 9. NICHE OVERLAP AND DYNAMICS (ecospat) ===\n")
+
+pres_vals_pre  <- terra::extract(env_pre_sel,  as.matrix(coords_pre))  %>% na.omit()
+pres_vals_post <- terra::extract(env_post_sel, as.matrix(coords_post)) %>% na.omit()
+if ("ID" %in% colnames(pres_vals_pre))  pres_vals_pre  <- pres_vals_pre[,  -1]
+if ("ID" %in% colnames(pres_vals_post)) pres_vals_post <- pres_vals_post[, -1]
+colnames(pres_vals_pre)  <- selected_vars
+colnames(pres_vals_post) <- selected_vars
+
+bg_vals_pre_niche  <- bg_vals_pre[,  selected_vars, drop = FALSE]
+bg_vals_post_niche <- bg_vals_post[, selected_vars, drop = FALSE]
+
+all_bg    <- rbind(bg_vals_pre_niche, bg_vals_post_niche)
+pca_niche <- ade4::dudi.pca(all_bg, center = TRUE, scale = TRUE,
+                            scannf = FALSE, nf = 2)
+
+cat(sprintf("PCA variance (2 axes): PC1 = %.1f%%, PC2 = %.1f%%, total = %.1f%%\n",
+            round(pca_niche$eig[1] / sum(pca_niche$eig) * 100, 1),
+            round(pca_niche$eig[2] / sum(pca_niche$eig) * 100, 1),
+            round(sum(pca_niche$eig[1:2]) / sum(pca_niche$eig) * 100, 1)))
+
+bg_pre_scores  <- ade4::suprow(pca_niche, bg_vals_pre_niche)$lisup
+bg_post_scores <- ade4::suprow(pca_niche, bg_vals_post_niche)$lisup
+bg_combined    <- rbind(bg_pre_scores, bg_post_scores)
+
+pre_scores  <- ade4::suprow(pca_niche, pres_vals_pre)$lisup
+post_scores <- ade4::suprow(pca_niche, pres_vals_post)$lisup
+
+R <- 100
+grid_pre  <- ecospat.grid.clim.dyn(glob = bg_combined,
+                                   glob1 = bg_pre_scores,
+                                   sp = pre_scores, R = R)
+grid_post <- ecospat.grid.clim.dyn(glob = bg_combined,
+                                   glob1 = bg_post_scores,
+                                   sp = post_scores, R = R)
+
+overlap   <- ecospat.niche.overlap(grid_pre, grid_post, cor = TRUE)
+niche_dyn <- ecospat.niche.dyn.index(grid_pre, grid_post)
+
+cat(sprintf("Schoener's D = %.4f | Hellinger's I = %.4f\n", overlap$D, overlap$I))
+cat(sprintf("Stability = %.4f | Expansion = %.4f | Unfilling = %.4f\n",
+            niche_dyn$dynamic.index.w["stability"],
+            niche_dyn$dynamic.index.w["expansion"],
+            niche_dyn$dynamic.index.w["unfilling"]))
+
+# Permutation tests (100 permutations each)
+cat("\nRunning permutation tests (100 permutations each)...\n")
+
+eq_test <- ecospat.niche.equivalency.test(
+  grid_pre, grid_post, rep = 100, overlap.alternative = "higher"
+)
+sim_test <- ecospat.niche.similarity.test(
+  grid_pre, grid_post, rep = 100, overlap.alternative = "higher"
+)
+
+cat(sprintf("Equivalency p (D) = %.4f\n", eq_test$p.D))
+cat(sprintf("Similarity  p (D) = %.4f\n", sim_test$p.D))
+
+saveRDS(list(overlap = overlap,
+             dynamics = niche_dyn,
+             equivalency = eq_test,
+             similarity = sim_test,
+             pca_variance = round(pca_niche$eig / sum(pca_niche$eig) * 100, 1)),
+        file.path(output_base, "random_bg", "niche_results.rds"))
+
+# Publication-quality niche plots
+niche_dir <- file.path(output_base, "niche_analysis_random")
+dir.create(file.path(niche_dir, "png"), recursive = TRUE, showWarnings = FALSE)
+dir.create(file.path(niche_dir, "svg"), recursive = TRUE, showWarnings = FALSE)
+
+png(file.path(niche_dir, "png", "niche_overlap.png"),
+    width = 10, height = 6, units = "in", res = 600)
+par(mfrow = c(1, 2), mar = c(4, 4, 4, 2), oma = c(0, 0, 3, 0))
+ecospat.plot.niche(grid_pre,  title = "Pre-2000 niche",
+                   name.axis1 = "PC1", name.axis2 = "PC2")
+ecospat.plot.niche(grid_post, title = "Post-2000 niche",
+                   name.axis1 = "PC1", name.axis2 = "PC2")
+mtext(sprintf("Schoener's D = %.3f | Hellinger's I = %.3f",
+              overlap$D, overlap$I), outer = TRUE, cex = 1.2, font = 2)
+dev.off()
+
+png(file.path(niche_dir, "png", "niche_dynamics.png"),
+    width = 7, height = 6, units = "in", res = 600)
+par(mar = c(5, 5, 4, 2))
+ecospat.plot.niche.dyn(grid_pre, grid_post,
+                       title = sprintf("Stability = %.3f | Expansion = %.3f | Unfilling = %.3f",
+                                       niche_dyn$dynamic.index.w["stability"],
+                                       niche_dyn$dynamic.index.w["expansion"],
+                                       niche_dyn$dynamic.index.w["unfilling"]),
+                       name.axis1 = "PC1", name.axis2 = "PC2")
+dev.off()
+
+# -----------------------------------------------------------------------------
+# 10. VARIABLE IMPORTANCE
+# -----------------------------------------------------------------------------
+cat("\n=== 10. VARIABLE IMPORTANCE ===\n")
+
+imp_pre  <- get_variables_importance(myBiomodModelOut_pre)
+imp_post <- get_variables_importance(myBiomodModelOut_post)
+
+agg_imp <- function(imp) {
+  imp %>%
+    group_by(expl.var) %>%
+    summarise(mean = round(mean(var.imp, na.rm = TRUE), 3),
+              sd   = round(sd(var.imp,   na.rm = TRUE), 3),
+              n    = n(),
+              .groups = "drop") %>%
+    arrange(desc(mean))
+}
+
+imp_pre_summary  <- agg_imp(imp_pre)
+imp_post_summary <- agg_imp(imp_post)
+
+cat("\nPre-2000:\n");  print(as.data.frame(imp_pre_summary))
+cat("\nPost-2000:\n"); print(as.data.frame(imp_post_summary))
+
+# -----------------------------------------------------------------------------
+# 11. POPULATION PCA (Monteverde, Central Plateau, San Vito)
+# -----------------------------------------------------------------------------
+cat("\n=== 11. POPULATION PCA ===\n")
+
+# Bounding boxes for the three geographic populations
+bboxes <- list(
+  "Monteverde"      = c(xmin = -84.90, xmax = -84.70, ymin = 10.20, ymax = 10.40),
+  "Central Plateau" = c(xmin = -84.30, xmax = -83.70, ymin =  9.70, ymax = 10.10),
+  "San Vito"        = c(xmin = -83.10, xmax = -82.90, ymin =  8.75, ymax =  8.95)
+)
+
+assign_population <- function(row) {
+  for (pop in names(bboxes)) {
+    b <- bboxes[[pop]]
+    if (row["x"] >= b["xmin"] && row["x"] <= b["xmax"] &&
+        row["y"] >= b["ymin"] && row["y"] <= b["ymax"]) return(pop)
+  }
+  "Other"
+}
+
+occ_all$population <- apply(occ_all[, c("x", "y")], 1, assign_population)
+cat("Population counts:\n"); print(table(occ_all$population))
+
+# Combine occurrences + background for PCA
+annae_sf <- st_as_sf(occ_all, coords = c("x", "y"), crs = 4326)
+set.seed(123)
+bg_sf <- st_sf(geometry = st_sample(cr, size = 10000, type = "random"))
+bg_sf$population <- "Background"
+
+all_points <- rbind(
+  annae_sf %>% dplyr::select(population, geometry),
+  bg_sf    %>% dplyr::select(population, geometry)
+)
+
+all_points_proj <- st_transform(all_points, crs(env_pre_sel))
+
+pca_data <- data.frame(population = all_points$population)
+for (v in selected_vars) {
+  pca_data[[v]] <- terra::extract(env_pre_sel[[v]], vect(all_points_proj))[, 2]
+}
+pca_data <- pca_data[complete.cases(pca_data), ]
+
+# Run PCA
+pca_result <- PCA(pca_data[, selected_vars], scale.unit = TRUE, graph = FALSE)
+
+eigenvalues <- data.frame(
+  PC = 1:nrow(pca_result$eig),
+  Eigenvalue         = round(pca_result$eig[, 1], 4),
+  Variance_Percent   = round(pca_result$eig[, 2], 2),
+  Cumulative_Percent = round(pca_result$eig[, 3], 2)
+)
+cat("\nPCA eigenvalues (first 4 PCs):\n"); print(head(eigenvalues, 4))
+
+pca_scores <- data.frame(
+  PC1 = pca_result$ind$coord[, 1],
+  PC2 = pca_result$ind$coord[, 2],
+  PC3 = pca_result$ind$coord[, 3],
+  PC4 = pca_result$ind$coord[, 4],
+  population = pca_data$population
+)
+
+pop_of_interest <- c("Monteverde", "Central Plateau", "San Vito")
+
+centroids <- pca_scores %>%
+  filter(population %in% pop_of_interest) %>%
+  group_by(population) %>%
+  summarise(across(starts_with("PC"), mean), n = n(), .groups = "drop")
+
+cat("\nPopulation centroids:\n"); print(as.data.frame(centroids))
+
+# Pairwise Wilcoxon tests (exploratory)
+tests <- data.frame()
+for (pc in c("PC1", "PC2", "PC3")) {
+  for (i in 1:(length(pop_of_interest) - 1)) {
+    for (j in (i + 1):length(pop_of_interest)) {
+      v1 <- pca_scores[pca_scores$population == pop_of_interest[i], pc]
+      v2 <- pca_scores[pca_scores$population == pop_of_interest[j], pc]
+      tests <- rbind(tests, data.frame(
+        PC = pc,
+        Comparison = paste(pop_of_interest[i], "vs", pop_of_interest[j]),
+        p_value = format.pval(wilcox.test(v1, v2)$p.value, digits = 4)
+      ))
+    }
+  }
+}
+cat("\nWilcoxon pairwise tests (exploratory):\n"); print(tests)
+
+# -----------------------------------------------------------------------------
+# 12. EXPORT ALL RESULTS
+# -----------------------------------------------------------------------------
+cat("\n=== 12. EXPORTING RESULTS ===\n")
+
+# Variable importance
+wb <- createWorkbook()
+addWorksheet(wb, "TSS_CV")
+tss_table <- get_evaluations(myBiomodModelOut_pre)
+tss_pre <- get_evaluations(myBiomodModelOut_pre) %>%
+  filter(metric.eval == "TSS") %>%
+  group_by(algo) %>%
+  summarise(period = "Pre-2000",
+            mean_TSS = round(mean(validation, na.rm = TRUE), 3),
+            sd_TSS   = round(sd(validation,   na.rm = TRUE), 3), .groups = "drop")
+tss_post <- get_evaluations(myBiomodModelOut_post) %>%
+  filter(metric.eval == "TSS") %>%
+  group_by(algo) %>%
+  summarise(period = "Post-2000",
+            mean_TSS = round(mean(validation, na.rm = TRUE), 3),
+            sd_TSS   = round(sd(validation,   na.rm = TRUE), 3), .groups = "drop")
+writeData(wb, "TSS_CV", bind_rows(tss_pre, tss_post))
+
+addWorksheet(wb, "Niche_Metrics")
+writeData(wb, "Niche_Metrics", data.frame(
+  Metric = c("Schoener_D", "Hellinger_I", "Stability", "Expansion",
+             "Unfilling", "Equivalency_p", "Similarity_p",
+             "PCA_PC1_var", "PCA_PC2_var", "PCA_total_2PC"),
+  Value = c(round(overlap$D, 4), round(overlap$I, 4),
+            round(niche_dyn$dynamic.index.w["stability"], 4),
+            round(niche_dyn$dynamic.index.w["expansion"], 4),
+            round(niche_dyn$dynamic.index.w["unfilling"], 4),
+            round(eq_test$p.D, 4),
+            round(sim_test$p.D, 4),
+            round(pca_niche$eig[1] / sum(pca_niche$eig) * 100, 1),
+            round(pca_niche$eig[2] / sum(pca_niche$eig) * 100, 1),
+            round(sum(pca_niche$eig[1:2]) / sum(pca_niche$eig) * 100, 1))
+))
+
+addWorksheet(wb, "Importance_Pre")
+writeData(wb, "Importance_Pre", imp_pre_summary)
+
+addWorksheet(wb, "Importance_Post")
+writeData(wb, "Importance_Post", imp_post_summary)
+
+addWorksheet(wb, "PCA_Eigenvalues")
+writeData(wb, "PCA_Eigenvalues", eigenvalues)
+
+addWorksheet(wb, "PCA_Centroids")
+writeData(wb, "PCA_Centroids", centroids)
+
+addWorksheet(wb, "PCA_Tests")
+writeData(wb, "PCA_Tests", tests)
+
+saveWorkbook(wb,
+             file.path(output_base, "REAL_VALUES_MANUSCRIPT.xlsx"),
+             overwrite = TRUE)
+
+cat("\n✅ All results saved to:",
+    file.path(output_base, "REAL_VALUES_MANUSCRIPT.xlsx"), "\n")
+
+# -----------------------------------------------------------------------------
+# 13. FINAL SUMMARY
+# -----------------------------------------------------------------------------
+cat("\n", rep("=", 70), "\n", sep = "")
+cat("ANALYSIS COMPLETE — SUMMARY FOR THE MANUSCRIPT\n")
+cat(rep("=", 70), "\n\n", sep = "")
+
+cat(sprintf("Cross-validated TSS range (all algorithms, both periods): %.2f–%.2f\n",
+            min(c(tss_pre$mean_TSS, tss_post$mean_TSS), na.rm = TRUE),
+            max(c(tss_pre$mean_TSS, tss_post$mean_TSS), na.rm = TRUE)))
+
+cat(sprintf("\nSchoener's D = %.3f | Hellinger's I = %.3f\n", overlap$D, overlap$I))
+cat(sprintf("Stability = %.3f | Expansion = %.3f | Unfilling = %.3f\n",
+            niche_dyn$dynamic.index.w["stability"],
+            niche_dyn$dynamic.index.w["expansion"],
+            niche_dyn$dynamic.index.w["unfilling"]))
+cat(sprintf("Equivalency p = %.4f | Similarity p = %.4f\n",
+            eq_test$p.D, sim_test$p.D))
+
+cat("\nTop 3 pre-2000 predictors:\n")
+print(head(imp_pre_summary, 3))
+cat("\nTop 3 post-2000 predictors:\n")
+print(head(imp_post_summary, 3))
+
+cat("\n", rep("=", 70), "\n", sep = "")
+cat("✅ DONE\n")
+cat(rep("=", 70), "\n", sep = "")
