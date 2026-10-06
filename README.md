@@ -1,104 +1,51 @@
-# annae_2026_status
-Data and code used in the paper Acosta-Chaves et al. From Protected Areas To Urban Refuges: The Status Of The Blue-Sided Leaf Frog (Agalychnis Annae) In Costa Rica 
-README – Supplementary R Scripts for Agalychnis annae Distribution Analysis
-Authors: Hector Zumbado, Victor Acosta
-Standardization and improvement: DeepSeek (AI assistant)
-Date: 2026-05-25
+From protected areas to anthropogenic landscapes: citizen science reveals recovery and future threats to the Blue-sided Leaf Frog (Agalychnis annae) in Costa Rica
 
-This repository contains four standardized R scripts that perform the complete data cleaning, spatial analysis, environmental mapping, population PCA, and protected‑area assessment for the frog Agalychnis annae in Costa Rica.
+Authors: Víctor J. Acosta-Chaves and Héctor Zumbado-Ulate
+Contact: victor.acosta@ucr.ac.cr · ORCID: 0000-0002-6126-622X
 
-Data access note:
-Some occurrence localities have been obscured because the species is sensitive to collection or disturbance. The full, precise coordinates are not included in this public repository. They can be obtained upon reasonable request to the corresponding authors, provided the requester holds a valid research permit from the relevant Costa Rican authorities (SINAC, MINAE, CONAGEBIO). The cleaned, aggregated data that are already anonymised are provided in the data/processed/ folder after running the scripts.
+Overview
+R scripts and data-processing code supporting our study on the distribution, habitat associations, and conservation status of Agalychnis annae in Costa Rica.
 
-Scripts overview
-Script	Description
-Supplementary_Code_1_Data_Cleaning_and_Full_Dataset.R	Downloads (optional), cleans, and merges occurrence records from GBIF, iNaturalist, UCR, citizen science, and Panama. Creates the full dataset and temporal subsets (pre‑2000 / post‑2000).
-Supplementary_Code_2_County_Analysis.R	Performs county‑level (cantonal) analyses: maps of observation counts, bar charts, latitudinal/longitudinal trends, first observation year, and density plots.
-Supplementary_Code_3_Environmental_Maps_and_Population_PCA.R	Generates publication‑quality maps for 22 environmental variables (19 bioclimatic + elevation + HFI + coffee) at 30‑arc‑second resolution, plus a PCA of three geographic populations and background points.
-Supplementary_Code_4_Protected_Areas_and_Corridors.R	Quantifies occurrence overlap with Costa Rican protected areas and biological corridors (including the 2024 Cubujuquí corridor). Produces four map variants (labeled, clean, numbered, patterned) and summary tables.
-Required R packages
-All scripts rely on the following packages. They are automatically installed if missing (except rgdal which is deprecated – we use sf and terra).
+Data access note
+Precise locality coordinates are not publicly distributed. Agalychnis annae is classified as Endangered (IUCN, criterion B1ab(iii)) and is a CITES-listed species subject to illegal collection for the pet trade. In addition, precise occurrence records of Costa Rican biodiversity fall under the Ley de Biodiversidad No. 7788, which requires prior authorization from CONAGEBIO (https://www.conagebio.go.cr).
 
-r
-pkgs <- c("sf", "ggplot2", "dplyr", "tidyr", "readr", 
-          "ggspatial", "ggrepel", "patchwork", "cowplot",
-          "terra", "FactoMineR", "factoextra", "writexl",
-          "ggpattern", "gridExtra")
-Folder structure
-Before running the scripts, create the following directory structure relative to your working directory:
+The full dataset with exact coordinates is available upon justified request to the corresponding author, contingent on a legitimate conservation or research purpose and, where required, proof of CONAGEBIO authorization.
 
-text
-your_project/
-├── data/
-│   ├── raw/                    # Place raw input files here
-│   │   ├── Agalychnis_annae_gbif_raw.rds
-│   │   ├── inat_annae.rds
-│   │   ├── Agalychnis_annae_ucr.rds
-│   │   ├── Agalychnis_annae_raw_media.rds
-│   │   └── Agalychnis_annae_panama.csv
-│   └── processed/              # Created automatically; cleaned outputs go here
-├── shapefiles/
-│   ├── costa_rica_wgs84.gpkg   # Costa Rica boundary
-│   ├── area_silvestre_protegida.gpkg
-│   ├── corredores_biologicos.gpkg
-│   ├── Corredor_Cubujuqui.shp  # 2024 corridor (optional)
-│   └── (other administrative layers: counties, provinces, etc.)
-├── rasters/
-│   └── env_stack_annae_30s.tif # 22‑layer environmental stack (30 arc‑sec)
-└── output/
-    ├── figures/                # Maps and plots
-    └── protected_areas_mainland/
-        ├── tables/
-        └── maps/
-Note: The environmental stack and shapefiles are not provided in this repository because of their large size. They can be obtained from public sources (WorldClim, HFI, ICAFE, SINAC).
+Aggregated, anonymised records are available through:
 
-Running the scripts
-Execute the scripts in numerical order because later scripts depend on outputs from earlier ones (e.g., the full dataset is created in Code 1 and used in Codes 2‑4).
+GBIF — DOI: 10.15468/dl.dm2amm
 
-bash
-Rscript Supplementary_Code_1_Data_Cleaning_and_Full_Dataset.R
-Rscript Supplementary_Code_2_County_Analysis.R
-Rscript Supplementary_Code_3_Environmental_Maps_and_Population_PCA.R
-Rscript Supplementary_Code_4_Protected_Areas_and_Corridors.R
-Each script will:
+iNaturalist — project "Distribution of the coffee frog Agalychnis annae"
 
-Check for required directories and create them if missing.
+Scripts
+Code	Purpose
+A	Data cleaning and full dataset assembly
+B	County-level distribution analysis
+C	Ensemble SDM (biomod2), niche overlap (ecospat), population PCA, maps, and results export
+D	Protected areas and biological corridors analysis
+Run them in alphabetical order. Tested with R 4.3.2.
 
-Load necessary libraries (install if absent).
+Public data sources
+Occurrences: GBIF, iNaturalist, MZUCR, verified citizen-science records
 
-Run the analysis and save outputs (tables, figures) into the output/ folder.
+Climate: WorldClim 2.1 (Fick & Hijmans, 2017)
 
-Print progress messages to the console.
+Elevation: SRTM (NASA/USGS)
 
-Expected outputs
-Code 1
-data/processed/Agalychnis_annae_full_dataset.rds – merged occurrences.
+Human Influence Index: WCS & CIESIN (2005)
 
-data/processed/Agalychnis_annae_predecline.rds – pre‑2000 subset.
+Coffee cover: ICAFE 2017–2018 (via SNIT)
 
-data/processed/Agalychnis_annae_postdecline.rds – post‑2000 subset.
+Boundaries, protected areas, corridors: IGN, SINAC
 
-Maps: output/figures/Agalychnis_annae_*.jpg.
+Citation
+If you use these scripts, please cite the manuscript (in review):
 
-Code 2
-data/processed/Agalychnis_annae_total_obs.csv – counts per county and time period.
+Acosta-Chaves, V. J., & Zumbado-Ulate, H. (2026). From protected areas to anthropogenic landscapes: citizen science reveals recovery and future threats to the Blue-sided Leaf Frog (Agalychnis annae) in Costa Rica.
 
-output/figures/Agalychnis_annae_*.jpg – county bar charts, lat/long trends, first observation plots.
+License
+Code: MIT License
 
-Code 3
-output/figures/maps_30s/individual/ – one map per variable (PNG, PDF, SVG).
+Data and figures: CC BY 4.0, except precise locality coordinates (restricted, see above)
 
-output/figures/maps_30s/variations/ – alternative backgrounds and HFI palettes.
 
-output/figures/population_pca/ – PCA biplot, boxplots, density plots, variable contributions, and pca_results.xlsx.
-
-Code 4
-output/protected_areas_mainland/tables/ – CSV summaries of points in PAs and corridors.
-
-output/protected_areas_mainland/maps/ – four map variants (PNG, PDF).
-
-License and citation
-These scripts are provided for reproducible research. If you use them, please cite the paper.
-
-Session info
-All scripts were tested with R version 4.3.2 and package versions current as of May 2026. A sessionInfo() log is saved with each run.
